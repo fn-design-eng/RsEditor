@@ -1,0 +1,5 @@
+/target
+/RsEditor.exe
+*.pdb
+~$*.pptx
+/dist
