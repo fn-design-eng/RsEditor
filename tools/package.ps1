@@ -132,7 +132,20 @@ try {
         foreach ($it in $items) {
             $it.Had = Test-Path $it.Dest
             if ($it.Had) { Move-Item $it.Dest (Join-Path $backup $it.Name) -Force }
-            if ($it.Name -eq 'RsEditor.exe') { Copy-Item $it.Src $it.Dest -Force } else { Move-Item $it.Src $it.Dest -Force }
+            if ($it.Name -eq 'RsEditor.exe') {
+                # 同じフォルダの一時名へコピーし、コピーが終わってから正式な名前へ改名する。
+                # 正式な名前へ直接コピーすると、途中 (ディスクの空きなど) で失敗したときに、
+                # 中途半端な exe が正式な名前のまま残る (以前の exe が無い初回は、元に戻す対象にもならない)
+                $tmpExe = "$($it.Dest).tmp-$([Guid]::NewGuid().ToString('N'))"
+                try {
+                    Copy-Item $it.Src $tmpExe -Force
+                    Move-Item $tmpExe $it.Dest -Force
+                }
+                finally {
+                    if (Test-Path $tmpExe) { Remove-Item $tmpExe -Force -ErrorAction SilentlyContinue }
+                }
+            }
+            else { Move-Item $it.Src $it.Dest -Force }
             $it.Done = $true
         }
     }

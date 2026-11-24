@@ -111,10 +111,12 @@ fn failed(e: impl std::fmt::Display) -> WriteError {
     WriteError::Failed(e.to_string())
 }
 
-/// 同じファイルかどうかを比べるためのキー。
+/// 同じファイルかどうかを比べるためのキー (パスの正規化形)。
 ///
 /// 正規化 (シンボリックリンクや `..` の解決) した絶対パスにする。Windows ではファイル名の
-/// 大文字小文字を区別しないので小文字にそろえる。存在しないパスは、そのままのパスを使う
+/// 大文字小文字を区別しないので小文字にそろえる。存在しないパスは、そのままのパスを使う。
+/// 存在するファイルの同一判定には、これではなく `FileKey` を使う (大文字小文字を区別する
+/// フォルダでは、名前が大文字小文字だけ違う別のファイルが並べて存在できるため)
 pub fn path_key(path: &Path) -> String {
     let p = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let s = p.to_string_lossy().into_owned();
@@ -125,16 +127,52 @@ pub fn path_key(path: &Path) -> String {
     }
 }
 
+/// 「同じファイルか」を判定するための目印。
+///
+/// 存在するファイルは、ファイルの識別子 (ボリュームのシリアル番号 + ファイルのインデックス) で
+/// 比べる。パスの書き方 (大文字小文字・`.`・シンボリックリンク) が違っても同じファイルなら
+/// 一致し、大文字小文字を区別するフォルダにある別のファイル (`Readme.txt` と `README.txt`) は
+/// 一致しない。識別子を取れないとき (Windows 以外・開けない) だけ、パスの正規化形で比べる
+#[derive(Clone, Debug)]
+pub struct FileKey {
+    path: String,
+    /// 存在するか (存在しないファイルと存在するファイルは、同じファイルではない)
+    exists: bool,
+    id: Option<FileId>,
+}
+
+impl FileKey {
+    pub fn of(path: &Path) -> Self {
+        let fp = fingerprint(path);
+        FileKey {
+            path: path_key(path),
+            exists: fp.is_some(),
+            id: fp.and_then(|f| f.id),
+        }
+    }
+
+    pub fn same_as(&self, other: &FileKey) -> bool {
+        if self.exists != other.exists {
+            return false;
+        }
+        match (self.id, other.id) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.path == other.path,
+        }
+    }
+}
+
 /// 一時ファイル・控えの名前に付ける連番 (同じ保存先に同時に書いても衝突しないように)
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// 一時ファイル・控えの名前。元のファイル名には依存させない (短い固定長にする)。
+///
+/// 元の名前に付け足すと、ファイル名の長さの上限 (255 文字) に近い名前のファイルを
+/// 開けても保存できなくなる。同じフォルダに置く (同じボリュームでないと置き換えが
+/// 原子的にならない) ので、衝突しないよう、プロセス番号と連番を入れる
 fn sibling_path(path: &Path, ext: &str) -> PathBuf {
     let n = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    path.with_file_name(format!(".{}.{}.{}.{}", name, std::process::id(), n, ext))
+    path.with_file_name(format!(".rse-{}-{}.{}", std::process::id(), n, ext))
 }
 
 fn exists_at(p: &Path) -> bool {
@@ -199,6 +237,184 @@ fn recover_failed_replace(target: &Path, temp: &Path, backup: &Path, err: &io::E
     ))
 }
 
+/// Win32 の API に渡すパス (NUL 終端の UTF-16)。
+///
+/// `\\?\` の付かないパスは、全体で 260 文字 (MAX_PATH) までしか扱えない。Rust の標準ライブラリは
+/// 長いパスに自動で `\\?\` を付けるので、そのパスで開いたファイルを、ここでの保存だけが
+/// 失敗しないよう、長いパスには同じ接頭辞を付ける (短いパスはそのまま渡す)
+#[cfg(windows)]
+fn wide_path(p: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    let bs = u16::from(b'\\');
+    let mut w: Vec<u16> = p.as_os_str().encode_wide().collect();
+    if w.len() >= 240 && !w.starts_with(&[bs, bs, u16::from(b'?'), bs]) {
+        if let Ok(abs) = std::path::absolute(p) {
+            let v: Vec<u16> = abs.as_os_str().encode_wide().collect();
+            let mut out: Vec<u16> = Vec::with_capacity(v.len() + 8);
+            if v.starts_with(&[bs, bs]) {
+                // UNC (\\server\share\...) は \\?\UNC\server\share\...
+                out.extend(r"\\?\UNC\".encode_utf16());
+                out.extend_from_slice(&v[2..]);
+            } else {
+                out.extend(r"\\?\".encode_utf16());
+                out.extend_from_slice(&v);
+            }
+            w = out;
+        }
+    }
+    w.push(0);
+    w
+}
+
+/// 一時ファイル専用のセキュリティ記述子: 現在のユーザーだけにアクセスを許し、
+/// 親フォルダからの継承も受けない (保護された DACL)。
+///
+/// 既存のファイルを上書きするとき、一時ファイルを既定のセキュリティ (フォルダから継承した、
+/// 他のユーザーも読める設定) で作ると、元のファイルが個別の ACL で保護されていても、保存中は
+/// 新しい内容 (全文) が他のユーザーに読めてしまう (異常終了で残った場合も同じ)。
+/// そこで、元のファイル以上に厳しい (自分だけの) 設定で作る。置き換え (`ReplaceFileW`) の
+/// ときに、元のファイルの ACL が最終的なファイルへ引き継がれる
+#[cfg(windows)]
+struct PrivateSecurity {
+    // sd の DACL は acl の中を指すので、acl が生きている間だけ sd を使える
+    _acl: Vec<u32>,
+    sd: windows_sys::Win32::Security::SECURITY_DESCRIPTOR,
+}
+
+#[cfg(windows)]
+impl PrivateSecurity {
+    fn new() -> io::Result<Self> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::{
+            AddAccessAllowedAce, GetLengthSid, GetTokenInformation, InitializeAcl,
+            InitializeSecurityDescriptor, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+            TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, SECURITY_DESCRIPTOR,
+            SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+        let fail = io::Error::last_os_error;
+        // SAFETY: 以下はすべて Win32 の呼び出し。渡すポインタは、呼び出しの間
+        // (SD が指す ACL は、返す値が生きている間) 有効なバッファを指す。
+        unsafe {
+            let mut token = 0isize;
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(fail());
+            }
+            // 現在のユーザーの SID を得る (必要な大きさを先に問い合わせる)
+            let mut need = 0u32;
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut need);
+            let mut buf = vec![0u64; (need as usize).div_ceil(8).max(1)];
+            let got = GetTokenInformation(
+                token,
+                TokenUser,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * 8) as u32,
+                &mut need,
+            );
+            let err = fail();
+            CloseHandle(token);
+            if got == 0 {
+                return Err(err);
+            }
+            let sid = (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+            // ACL: ヘッダ + 許可の ACE 1 つ (ACE の末尾の SID の分は GetLengthSid で足す)
+            let ace_len = std::mem::size_of::<ACCESS_ALLOWED_ACE>() - std::mem::size_of::<u32>()
+                + GetLengthSid(sid) as usize;
+            let acl_len = (std::mem::size_of::<ACL>() + ace_len).next_multiple_of(4);
+            let mut acl = vec![0u32; acl_len / 4];
+            let pacl = acl.as_mut_ptr().cast::<ACL>();
+            if InitializeAcl(pacl, acl_len as u32, ACL_REVISION) == 0 {
+                return Err(fail());
+            }
+            if AddAccessAllowedAce(pacl, ACL_REVISION, FILE_ALL_ACCESS, sid) == 0 {
+                return Err(fail());
+            }
+            let mut sd: SECURITY_DESCRIPTOR = std::mem::zeroed();
+            let psd = (&mut sd as *mut SECURITY_DESCRIPTOR).cast();
+            if InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION) == 0 {
+                return Err(fail());
+            }
+            if SetSecurityDescriptorDacl(psd, 1, pacl, 0) == 0 {
+                return Err(fail());
+            }
+            // 保護: 親フォルダの ACL を継承しない
+            if SetSecurityDescriptorControl(psd, SE_DACL_PROTECTED, SE_DACL_PROTECTED) == 0 {
+                return Err(fail());
+            }
+            Ok(PrivateSecurity { _acl: acl, sd })
+        }
+    }
+}
+
+/// 一時ファイルを新しく作って開く (すでにあれば失敗する)。
+/// `private` のとき (既存のファイルの上書き) は、自分だけが開ける設定で作る。
+/// 設定を作れなければ、既定の設定で書くことはせず失敗させる
+#[cfg(windows)]
+fn create_temp(temp: &Path, private: bool) -> io::Result<std::fs::File> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+    let name = wide_path(temp);
+    let mut sec = if private {
+        Some(PrivateSecurity::new().map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("一時ファイルのアクセス権を設定できませんでした: {e}"),
+            )
+        })?)
+    } else {
+        None
+    };
+    let mut attrs = sec.as_mut().map(|s| SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: (&mut s.sd as *mut windows_sys::Win32::Security::SECURITY_DESCRIPTOR).cast(),
+        bInheritHandle: 0,
+    });
+    let pattrs = attrs
+        .as_mut()
+        .map_or(std::ptr::null(), |a| a as *const SECURITY_ATTRIBUTES);
+    // SAFETY: name は NUL 終端の UTF-16。pattrs は NULL か、呼び出しの間生きている
+    // SECURITY_ATTRIBUTES (その記述子は `sec` が持つバッファを指す)。
+    let h = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            pattrs,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            0,
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: CreateFileW が返した、自分だけが持つ有効なハンドル
+    Ok(unsafe { std::fs::File::from_raw_handle(h as _) })
+}
+
+#[cfg(not(windows))]
+fn create_temp(temp: &Path, private: bool) -> io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // 既存のファイルの上書きでは、置き換えまでの間は自分だけが読めるようにする
+        if private {
+            o.mode(0o600);
+        }
+    }
+    let _ = private;
+    o.open(temp)
+}
+
 #[cfg(windows)]
 fn replace_file(
     target: &Path,
@@ -206,12 +422,10 @@ fn replace_file(
     backup: &Path,
     target_exists: bool,
 ) -> Result<(), WriteError> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH,
     };
-    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
-    let (t, s, b) = (wide(target), wide(temp), wide(backup));
+    let (t, s, b) = (wide_path(target), wide_path(temp), wide_path(backup));
     if target_exists {
         // SAFETY: t / s / b は NUL 終端の UTF-16 文字列で、呼び出しの間は生きている。
         // 除外・予約の引数は仕様どおり NULL。
@@ -294,20 +508,37 @@ fn replace_file(
 /// なお、この最後の確認から置き換えの瞬間までの間に他のプログラムが書き込む競合は、
 /// 原理的には残る (Windows のファイル置き換えに「指紋が同じときだけ」という条件を付ける
 /// 方法が無いため)。その間隔は一瞬に絞ってある。
-pub fn atomic_write(path: &Path, bytes: &[u8], expect: &Expect) -> Result<(), WriteError> {
-    let temp = unused_sibling(path, "rstmp");
-    let backup = unused_sibling(path, "rsbak");
+pub fn atomic_write(path: &Path, bytes: &[u8], expect: &Expect) -> Result<Written, WriteError> {
+    let temp = unused_sibling(path, "tmp");
+    let backup = unused_sibling(path, "bak");
     atomic_write_at(path, bytes, expect, &temp, &backup)
 }
 
-/// `atomic_write` の本体。一時ファイル・控えの名前を指定する
+/// 書き込みが成功した後の、保存先の状態
+#[derive(Debug, PartialEq, Eq)]
+pub enum Written {
+    /// 保存先が、いま書いた内容そのものであることを確かめられた。その指紋
+    Verified(Fingerprint),
+    /// 置き換えの後で保存先を確かめたら、書いたものと一致しなかった (同期ツールなどが
+    /// 置き換えの直後に別の版へ差し替えた可能性がある) か、確かめられなかった。
+    /// 保存先の指紋は「不明」として扱い、次の保存の前に確認する
+    Unverified,
+}
+
+/// `atomic_write` の本体。一時ファイル・控えの名前を指定する。
+///
+/// 書いた後の確認: 置き換えの前に、一時ファイル自身のハンドルから (内容を同期した後の)
+/// 指紋 (大きさ・更新日時・ファイルの識別子) を取っておき、置き換えの後で保存先の指紋と
+/// 全項目を比べる。置き換えは一時ファイルそのものを保存先の名前にするので、一致するはず
+/// である。保存後にもう一度ファイルを開いて指紋を取り直す方法だと、その間に同期ツールが
+/// ファイルを差し替えた場合に、他者の版の指紋を「自分が書いたもの」として覚えてしまう
 fn atomic_write_at(
     path: &Path,
     bytes: &[u8],
     expect: &Expect,
     temp: &Path,
     backup: &Path,
-) -> Result<(), WriteError> {
+) -> Result<Written, WriteError> {
     let existing = std::fs::metadata(path).ok();
     if let Some(m) = &existing {
         if m.permissions().readonly() {
@@ -315,13 +546,12 @@ fn atomic_write_at(
         }
     }
     // 一時ファイルは、自分で作れたとき (create_new が成功したとき) だけ削除の対象にする。
-    // すでに同じ名前のファイルがあった場合は、他のファイルなので触らずに失敗する
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temp)
-        .map_err(failed)?;
+    // すでに同じ名前のファイルがあった場合は、他のファイルなので触らずに失敗する。
+    // 既存のファイルの上書きでは、置き換えまでの間 (と、異常終了で残った場合) に、
+    // 新しい内容を他のユーザーが読めないよう、自分だけが開ける設定で作る
+    let mut f = create_temp(temp, existing.is_some()).map_err(failed)?;
     let written = f.write_all(bytes).and_then(|_| f.sync_all());
+    let wrote = written.is_ok().then(|| Fingerprint::from_file(&f)).flatten();
     drop(f);
     if let Err(e) = written {
         remove_own_temp(temp);
@@ -337,7 +567,11 @@ fn atomic_write_at(
         #[cfg(test)]
         Expect::Any => {}
     }
-    replace_file(path, temp, backup, existing.is_some())
+    replace_file(path, temp, backup, existing.is_some())?;
+    Ok(match (wrote, fingerprint(path)) {
+        (Some(w), Some(now)) if w == now => Written::Verified(now),
+        _ => Written::Unverified,
+    })
 }
 
 /// 読み込みの失敗
@@ -443,7 +677,7 @@ mod tests {
             std::fs::read_dir(&self.0)
                 .unwrap()
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .filter(|n| n.ends_with(".rstmp") || n.ends_with(".rsbak"))
+                .filter(|n| n.starts_with(".rse-"))
                 .collect()
         }
     }
@@ -464,7 +698,7 @@ mod tests {
     }
 
     fn write(p: &Path, bytes: &[u8]) -> Result<(), WriteError> {
-        atomic_write(p, bytes, &Expect::Any)
+        atomic_write(p, bytes, &Expect::Any).map(|_| ())
     }
 
     #[test]
@@ -730,5 +964,178 @@ mod tests {
         }
         std::fs::write(d.file("other.txt"), b"y").unwrap();
         assert_ne!(path_key(&p), path_key(&d.file("other.txt")));
+    }
+
+    /// 書いた直後の保存先は、一時ファイルのハンドルから取った指紋と全項目が一致する
+    /// (置き換えの後も、大きさ・更新日時・ファイルの識別子が変わらない)
+    #[test]
+    fn written_state_is_verified_for_new_and_replaced_files() {
+        let d = TempDir::new();
+        let p = d.file("a.txt");
+        // 新規
+        let w = atomic_write(&p, b"first", &Expect::Is(None)).unwrap();
+        assert_eq!(w, Written::Verified(fingerprint(&p).unwrap()));
+        // 置き換え (ReplaceFileW を通る)
+        let seen = fingerprint(&p);
+        let w = atomic_write(&p, b"second, longer", &Expect::Is(seen)).unwrap();
+        assert_eq!(w, Written::Verified(fingerprint(&p).unwrap()));
+        assert_eq!(std::fs::read(&p).unwrap(), b"second, longer");
+        // 書いた後に他者が差し替えれば、書いたときの指紋とは一致しない
+        let mine = fingerprint(&p).unwrap();
+        std::fs::write(&p, b"someone else's version").unwrap();
+        assert_ne!(fingerprint(&p).unwrap(), mine);
+    }
+
+    /// 255 文字に近い長いファイル名でも保存できる (一時ファイル・控えの名前は元の名前に依存しない)
+    #[test]
+    fn long_file_name_can_be_saved() {
+        let d = TempDir::new();
+        let name = format!("{}.txt", "a".repeat(246));
+        assert_eq!(name.len(), 250);
+        let p = d.file(&name);
+        write(&p, b"first").unwrap(); // 新規
+        write(&p, b"second").unwrap(); // 置き換え
+        assert_eq!(std::fs::read(&p).unwrap(), b"second");
+        assert!(d.leftovers().is_empty(), "{:?}", d.leftovers());
+        // 一時ファイル・控えの名前は短く固定長
+        let t = sibling_path(&p, "tmp");
+        assert!(t.file_name().unwrap().len() < 40, "{t:?}");
+    }
+
+    /// 存在するファイルは識別子で比べる。同じファイルなら書き方が違っても一致し、
+    /// 別のファイルは一致しない。存在しないものは、存在するものとは別 (パスだけで比べる)
+    #[test]
+    fn file_key_compares_identity() {
+        let d = TempDir::new();
+        let a = d.file("Case.txt");
+        let b = d.file("other.txt");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap(); // 内容・大きさが同じでも別のファイル
+        let ka = FileKey::of(&a);
+        assert!(!ka.same_as(&FileKey::of(&b)));
+        assert!(ka.same_as(&FileKey::of(&d.0.join(".").join("Case.txt"))));
+        #[cfg(windows)]
+        {
+            assert!(ka.id.is_some(), "Windows では識別子を取れる");
+            assert!(ka.same_as(&FileKey::of(&d.file("CASE.TXT"))));
+            // 識別子が違えば、パスが (大文字小文字を除いて) 同じでも別のファイルとして扱う
+            // (大文字小文字を区別するフォルダの Readme.txt と README.txt を想定)
+            let mut other = FileKey::of(&b);
+            other.path = ka.path.clone();
+            assert!(!ka.same_as(&other));
+        }
+        // 存在しないパス同士は、パスで比べる。存在するものとは別
+        let (m1, m2) = (FileKey::of(&d.file("nope.txt")), FileKey::of(&d.file("NOPE.txt")));
+        assert_eq!(m1.same_as(&m2), cfg!(windows));
+        assert!(!m1.same_as(&ka));
+        assert!(m1.same_as(&FileKey::of(&d.file("nope.txt"))));
+    }
+
+    /// Windows: 既存のファイルを上書きするときの一時ファイルは、自分だけが開ける保護された
+    /// DACL で作られる。置き換えの後は、元のファイルの ACL が引き継がれる
+    #[cfg(windows)]
+    mod acl {
+        use super::*;
+        use windows_sys::Win32::Security::{
+            AclSizeInformation, GetAce, GetAclInformation, GetFileSecurityW, GetLengthSid,
+            GetSecurityDescriptorControl, GetSecurityDescriptorDacl, ACCESS_ALLOWED_ACE,
+            ACE_HEADER, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        };
+
+        /// (DACL が保護されているか, 各 ACE の (種類, マスク, SID のバイト列))
+        pub(super) fn dacl(path: &Path) -> (bool, Vec<(u8, u32, Vec<u8>)>) {
+            let w = wide_path(path);
+            // SAFETY: バッファの大きさは API に伝えたとおり。得たポインタはバッファの中を指す。
+            unsafe {
+                let mut need = 0u32;
+                GetFileSecurityW(
+                    w.as_ptr(),
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut need,
+                );
+                let mut buf = vec![0u64; (need as usize).div_ceil(8).max(1)];
+                let ok = GetFileSecurityW(
+                    w.as_ptr(),
+                    DACL_SECURITY_INFORMATION,
+                    buf.as_mut_ptr().cast(),
+                    (buf.len() * 8) as u32,
+                    &mut need,
+                );
+                assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+                let sd = buf.as_mut_ptr().cast();
+                let (mut control, mut rev) = (0u16, 0u32);
+                assert_ne!(GetSecurityDescriptorControl(sd, &mut control, &mut rev), 0);
+                let (mut present, mut defaulted) = (0i32, 0i32);
+                let mut acl: *mut ACL = std::ptr::null_mut();
+                assert_ne!(
+                    GetSecurityDescriptorDacl(sd, &mut present, &mut acl, &mut defaulted),
+                    0
+                );
+                let mut aces = Vec::new();
+                if present != 0 && !acl.is_null() {
+                    let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+                    assert_ne!(
+                        GetAclInformation(
+                            acl,
+                            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                            AclSizeInformation,
+                        ),
+                        0
+                    );
+                    for i in 0..info.AceCount {
+                        let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
+                        assert_ne!(GetAce(acl, i, &mut ace), 0);
+                        let hdr = *(ace as *const ACE_HEADER);
+                        // 許可 (0) / 拒否 (1) の ACE は、ヘッダ・マスク・SID の順に並ぶ
+                        let a = ace as *const ACCESS_ALLOWED_ACE;
+                        let sid = std::ptr::addr_of!((*a).SidStart) as *mut std::ffi::c_void;
+                        let len = GetLengthSid(sid) as usize;
+                        let bytes = std::slice::from_raw_parts(sid as *const u8, len).to_vec();
+                        aces.push((hdr.AceType, (*a).Mask, bytes));
+                    }
+                }
+                (control & SE_DACL_PROTECTED != 0, aces)
+            }
+        }
+
+        #[test]
+        fn temp_file_for_existing_target_is_private() {
+            let d = TempDir::new();
+            let t = d.file(".rse-1-1.tmp");
+            drop(create_temp(&t, true).unwrap());
+            let (protected, aces) = dacl(&t);
+            assert!(protected, "親フォルダの ACL を継承しない");
+            assert_eq!(aces.len(), 1, "許可は 1 件だけ: {aces:?}");
+            assert_eq!(aces[0].0, 0, "許可の ACE");
+            // 新規ファイル用 (private でない) は既定のまま (フォルダから継承する)
+            let u = d.file(".rse-1-2.tmp");
+            drop(create_temp(&u, false).unwrap());
+            assert!(!dacl(&u).0);
+            // すでにあれば失敗する (他のファイルを開かない)
+            assert!(create_temp(&t, true).is_err());
+        }
+
+        #[test]
+        fn replace_keeps_original_acl_and_cleans_up() {
+            let d = TempDir::new();
+            let p = d.file("a.txt");
+            std::fs::write(&p, b"original").unwrap();
+            // 元のファイルに、個別の ACE (Everyone の読み取り) を足す
+            let out = std::process::Command::new("icacls")
+                .arg(&p)
+                .args(["/grant", "*S-1-1-0:(R)"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+            let before = dacl(&p);
+            assert!(before.1.len() >= 2, "{before:?}");
+            write(&p, b"new content").unwrap();
+            assert_eq!(std::fs::read(&p).unwrap(), b"new content");
+            assert_eq!(dacl(&p), before, "元のファイルの ACL が引き継がれる");
+            assert!(d.leftovers().is_empty(), "{:?}", d.leftovers());
+        }
     }
 }

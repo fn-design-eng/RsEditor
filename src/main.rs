@@ -157,6 +157,9 @@ struct Doc {
     saved: Snapshot,
     /// 保存・読み込みした時点のファイルの指紋。外部での変更の検出に使う
     fingerprint: Option<Fingerprint>,
+    /// 保存した直後に、保存先が書いた内容と一致するか確かめられなかった
+    /// (`fileio::Written::Unverified`)。指紋が当てにならないので、次の保存の前に確認する
+    disk_unverified: bool,
     cursor_idx: usize,
     line_col: (usize, usize),
     /// 文字列を変更するたびに増やす版番号 (各種キャッシュの判定に使う)
@@ -186,6 +189,7 @@ impl Doc {
             lossy_load: false,
             saved: Snapshot::of("", Enc::Utf8, Eol::CrLf),
             fingerprint: None,
+            disk_unverified: false,
             cursor_idx: 0,
             line_col: (1, 1),
             rev: 0,
@@ -346,8 +350,19 @@ fn set_editor_sel(ctx: &egui::Context, id: egui::Id, start: usize, end: usize) {
 /// 無い (複製の確保の失敗も捕まえられない)。そこで、複製されても困らない大きさに収まるよう、
 /// 文書の大きさに反比例して件数を減らす (全体で約 256 MiB、最小 2 件、最大 100 件)。
 fn undo_limit(text_len: usize) -> usize {
+    #[cfg(not(test))]
     const BUDGET: usize = 256 * 1024 * 1024;
-    (BUDGET / text_len.max(1)).clamp(2, 100)
+    // テストでは、小さな文書で件数が絞られる状況を作れるよう、予算を差し替えられる
+    #[cfg(test)]
+    let budget = TEST_UNDO_BUDGET.with(|b| b.get()).unwrap_or(256 * 1024 * 1024);
+    #[cfg(not(test))]
+    let budget = BUDGET;
+    (budget / text_len.max(1)).clamp(2, 100)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_UNDO_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 type Undoer = egui::util::undoer::Undoer<(CCursorRange, String)>;
@@ -473,6 +488,48 @@ fn reset_editor_state(ctx: &egui::Context, id: egui::Id, text_len: usize) {
     ctx.data_mut(|d| d.insert_temp(id, UndoLimit(limit)));
 }
 
+/// 編集や貼り付けで文書が大きくなり、Undo 履歴の件数の上限 (`undo_limit`) が下の段階に
+/// 入ったときに、履歴を新しい上限の履歴へ作り直す (最近の状態は残す)。
+///
+/// 読み込み時にだけ件数を決めると、空のタブへ大きな文章を貼り付けた文書などが、
+/// 既定の 100 件のまま巨大な本文を何十個も覚えてしまう。
+/// egui の `Undoer` には履歴を読み出す API が無いので、複製に対して `undo` を繰り返し呼んで
+/// 古い状態を順に取り出し、新しい `Undoer` へ古い方から積み直す。段階をまたいだときだけ
+/// 呼ぶので (編集のたびではない)、複製のコストは稀にしか掛からない。
+/// 現在の状態 (貼り付けの直後など) も取り消し点として積むので、貼り付けは Ctrl+Z で戻せる。
+/// 複製できないほどメモリが足りないときは何もしない (次の編集でもう一度試す)
+fn shrink_undo_history(ctx: &egui::Context, id: egui::Id, text: &str, want: usize) {
+    let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+    let range = state
+        .cursor
+        .char_range()
+        .unwrap_or_else(|| CCursorRange::one(CCursor::new(0)));
+    let Some(copy) = try_clone(text) else {
+        return;
+    };
+    let current = (range, copy);
+    let mut old = state.undoer();
+    // 新しい方から、現在の状態を除いて want - 1 件まで取り出す
+    let mut recent = Vec::new();
+    let mut probe = current.clone();
+    while recent.len() + 1 < want {
+        let Some(prev) = old.undo(&probe).cloned() else {
+            break;
+        };
+        probe = prev.clone();
+        recent.push(prev);
+    }
+    drop(old);
+    let mut undoer = bounded_undoer(want);
+    while let Some(st) = recent.pop() {
+        undoer.add_undo(&st);
+    }
+    undoer.add_undo(&current);
+    state.set_undoer(undoer);
+    state.store(ctx, id);
+    ctx.data_mut(|d| d.insert_temp(id, UndoLimit(want)));
+}
+
 /// 閉じた文書の編集欄の状態 (Undo 履歴を含む) を、egui の記憶から取り除く。
 /// 取り除かないと、閉じたタブの履歴 (本文の複製を含む) がずっと残る
 fn forget_editor_state(ctx: &egui::Context, id: egui::Id) {
@@ -496,6 +553,18 @@ fn line_indent(text: &str, pos: usize) -> &str {
         .take_while(|&&c| c == b' ' || c == b'\t')
         .count();
     &text[line_start..line_start + n]
+}
+
+/// キャレットや選択範囲を動かす入力か (この入力の後ろにある Enter は、動いた後の位置で
+/// インデントを求める必要がある)。Enter 以外のキー (矢印・Home/End・PageUp/Down・Ctrl+A など)、
+/// マウスのボタン、ドラッグ中のマウスの移動が該当する。
+/// `dragging` はこのフレームの終わりにマウスのボタンが押されたままか
+fn moves_caret(e: &egui::Event, dragging: bool) -> bool {
+    match e {
+        egui::Event::Key { pressed: true, .. } | egui::Event::PointerButton { .. } => true,
+        egui::Event::PointerMoved(_) => dragging,
+        _ => false,
+    }
 }
 
 /// 本文を書き換える入力か (この入力の後ろにある Enter は、書き換え後の本文で処理する必要がある)
@@ -532,8 +601,9 @@ fn mutates_text(e: &egui::Event) -> bool {
 /// 同じに扱われる (改行とインデントは 1 つの入力として一緒に戻る)。
 /// IME の確定 Enter は `ImeGuard` が先に取り除くので、ここへは届かない。
 ///
-/// インデントは「このフレームの最初の時点の本文」から求める。同じフレームで Enter より前に
-/// 本文を書き換える入力 (文字入力・貼り付けなど) があると、その結果が反映されていない本文で
+/// インデントは「このフレームの最初の時点の本文とキャレット」から求める。同じフレームで
+/// Enter より前に本文を書き換える入力 (文字入力・貼り付けなど) や、キャレット・選択範囲を
+/// 動かす入力 (矢印キー・マウスなど。`moves_caret`) があると、その結果が反映されていない状態で
 /// 求めてしまう。そのときは、その Enter と後ろのイベントをこのフレームの入力から外して返す。
 /// 呼び出し側は、それを次のフレームの入力の先頭へ戻す (`App::deferred_events`)。
 fn apply_auto_indent(ctx: &egui::Context, id: egui::Id, text: &str) -> Vec<egui::Event> {
@@ -554,6 +624,7 @@ fn apply_auto_indent(ctx: &egui::Context, id: egui::Id, text: &str) -> Vec<egui:
     let newline = format!("\n{}", line_indent(text, caret));
     let has_indent = newline.len() > 1;
     ctx.input_mut(|i| {
+        let dragging = i.pointer.any_down();
         let mut mutated = false;
         let mut defer_from = None;
         for (n, e) in i.events.iter_mut().enumerate() {
@@ -566,7 +637,7 @@ fn apply_auto_indent(ctx: &egui::Context, id: egui::Id, text: &str) -> Vec<egui:
                     *e = egui::Event::Text(newline.clone());
                 }
                 mutated = true;
-            } else if mutates_text(e) {
+            } else if mutates_text(e) || moves_caret(e, dragging) {
                 mutated = true;
             }
         }
@@ -902,6 +973,13 @@ struct Confirmed {
     conflict: Option<Option<Fingerprint>>,
     /// 文字コードで表現できない文字が変わること
     lossy: bool,
+    /// 保存先を選んだ (保存を始めた) 時点で、保存先が「こうなっているはず」と承知した状態
+    /// (`None` はまだ決めていない。`Some(None)` は「存在しない」)。確認の画面をいくつはさんでも
+    /// 持ち回り、保存の直前にこのとおりかを確かめる。確認のたびに「いま見えている状態」を
+    /// 取り直すと、確認の待ち時間の間に他のプログラムが作った・変えたファイルを、
+    /// 気づかずに承知したことにして上書きしてしまう。更新してよいのは、利用者が
+    /// 「上書きする」(`conflict`) と答えたときだけ
+    baseline: Option<Option<Fingerprint>>,
 }
 
 #[derive(Clone)]
@@ -1111,8 +1189,12 @@ impl ImeGuard {
                     pressed: false,
                     ..
                 } => {
-                    // 離された: これ以降の押下は新しい押下
+                    // 離された: これ以降の押下は新しい押下。確定の Enter の押下が
+                    // アプリに届かないまま (変換の処理に取られて) 離された場合も、
+                    // 確定の後の Enter 用に残っている取り除く権利は、ここで使い切ったものとする
+                    // (残すと、次の本物の Enter が 1 回だけ取り除かれてしまう)
                     self.enter_held_since = None;
+                    self.commit_enter_budget = 0;
                     out.push(e);
                 }
                 egui::Event::Key {
@@ -1171,8 +1253,8 @@ struct LoadOrigin {
 /// バックグラウンドのスレッドで実行中の読み込み
 struct PendingLoad {
     path: PathBuf,
-    /// 同じファイルかどうかの判定用 (`fileio::path_key`)
-    key: String,
+    /// 同じファイルかどうかの判定用 (`fileio::FileKey`)
+    key: fileio::FileKey,
     kind: LoadKind,
     origin: LoadOrigin,
     rx: mpsc::Receiver<Result<fileio::Loaded, fileio::LoadError>>,
@@ -1222,9 +1304,10 @@ struct App {
     loads: Vec<PendingLoad>,
     /// タブの列をスクロールして見せ終わった、選択中の文書 (選択が変わったときだけスクロールする)
     tab_shown: Option<u64>,
-    /// 自動インデントが次のフレームへ持ち越した入力 (`apply_auto_indent`)。
-    /// 次のフレームの入力の先頭へ戻す
-    deferred_events: Vec<egui::Event>,
+    /// 自動インデントが次のフレームへ持ち越した入力 (`apply_auto_indent`) と、その入力の宛先の
+    /// 文書の id。次のフレームの入力の先頭へ戻す。そのとき宛先の文書が選択中・フォーカス中で
+    /// なければ、別のタブへ入力が流れ込まないよう捨てる
+    deferred_events: Option<(u64, Vec<egui::Event>)>,
 }
 
 impl App {
@@ -1261,7 +1344,7 @@ impl App {
             ctx,
             loads: Vec::new(),
             tab_shown: None,
-            deferred_events: Vec::new(),
+            deferred_events: None,
         };
         app.new_doc();
         app
@@ -1292,12 +1375,12 @@ impl App {
         self.docs.iter().position(|d| d.id == id)
     }
 
-    /// 同じファイル (`fileio::path_key` が等しい) を開いているタブ
-    fn find_doc_by_key(&self, key: &str) -> Option<usize> {
+    /// 同じファイル (`fileio::FileKey` が同じ) を開いているタブ
+    fn find_doc_by_key(&self, key: &fileio::FileKey) -> Option<usize> {
         self.docs.iter().position(|d| {
             d.path
                 .as_deref()
-                .is_some_and(|p| fileio::path_key(p) == key)
+                .is_some_and(|p| fileio::FileKey::of(p).same_as(key))
         })
     }
 
@@ -1342,13 +1425,13 @@ impl App {
     /// 大きなファイルは `confirmed_large` でなければ、先に確認する。
     /// `forced` を指定すると、その文字コードで読む
     fn open_path_checked(&mut self, path: PathBuf, confirmed_large: bool, forced: Option<Enc>) {
-        let key = fileio::path_key(&path);
+        let key = fileio::FileKey::of(&path);
         if let Some(i) = self.find_doc_by_key(&key) {
             self.active = i;
             self.focus_editor = true;
             return;
         }
-        if self.loads.iter().any(|l| l.key == key) {
+        if self.loads.iter().any(|l| l.key.same_as(&key)) {
             self.status = format!("{} は読み込み中です", path.display());
             return;
         }
@@ -1364,7 +1447,7 @@ impl App {
     }
 
     /// 読み込みをバックグラウンドのスレッドで始める (読み込み中も他のタブを操作できる)
-    fn start_load(&mut self, path: PathBuf, key: String, kind: LoadKind, forced: Option<Enc>) {
+    fn start_load(&mut self, path: PathBuf, key: fileio::FileKey, kind: LoadKind, forced: Option<Enc>) {
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
         let p = path.clone();
@@ -1451,8 +1534,10 @@ impl App {
             origin,
             ..
         } = l;
-        // 選択・フォーカスを動かしてよいのは、ユーザーが読み込みの間に何も変えていないときだけ
-        let follow = self.user_unchanged_since(ctx, &origin);
+        // 選択・フォーカスを動かしてよいのは、ユーザーが読み込みの間に何も変えていないときだけ。
+        // 自動インデントが入力を次のフレームへ持ち越している間は、その入力が選択中の文書へ
+        // 届くよう、選択を動かさない (新しいタブは追加だけして、選択はしない)
+        let follow = self.deferred_events.is_none() && self.user_unchanged_since(ctx, &origin);
         match (kind, result) {
             (LoadKind::Open, Err(fileio::LoadError::Utf32 { name, as_utf16 })) => {
                 self.push_modal(Modal::Utf32 {
@@ -1536,7 +1621,7 @@ impl App {
                 let same_path = d
                     .path
                     .as_deref()
-                    .is_some_and(|p| fileio::path_key(p) == key);
+                    .is_some_and(|p| fileio::FileKey::of(p).same_as(&key));
                 if d.generation != generation || !same_path {
                     self.status = "読み込み中に変更されたため、開き直しを中止しました".into();
                     return;
@@ -1548,6 +1633,7 @@ impl App {
                 d.lossy_load = loaded.lossy;
                 d.mixed_eol = loaded.mixed_eol;
                 d.fingerprint = loaded.fingerprint;
+                d.disk_unverified = false;
                 d.mark_saved();
                 d.edited();
                 d.cursor_idx = 0;
@@ -1650,20 +1736,21 @@ impl App {
         then: Then,
         ok: Confirmed,
     ) -> bool {
-        let key = fileio::path_key(&path);
+        let key = fileio::FileKey::of(&path);
         // 別のタブで開いているファイルへは保存しない (同じファイルの二重管理になるため)
         let open_elsewhere = self.docs.iter().enumerate().any(|(i, d)| {
             i != idx
                 && d.path
                     .as_deref()
-                    .is_some_and(|p| fileio::path_key(p) == key)
+                    .is_some_and(|p| fileio::FileKey::of(p).same_as(&key))
         }) || self
             .loads
             .iter()
-            .any(|l| matches!(l.kind, LoadKind::Open) && l.key == key);
+            .any(|l| matches!(l.kind, LoadKind::Open) && l.key.same_as(&key));
         if open_elsewhere {
             self.modals.push_back(Modal::Info(format!(
-                "そのファイルは別のタブで開いています:\n{}",
+                "そのファイルは別のタブで開いています:
+{}",
                 path.display()
             )));
             return false;
@@ -1674,7 +1761,47 @@ impl App {
         let same_file = d
             .path
             .as_deref()
-            .is_some_and(|p| fileio::path_key(p) == key);
+            .is_some_and(|p| fileio::FileKey::of(p).same_as(&key));
+        // 保存先が、ユーザーが承知した状態のままか。承知した状態 (`expected`) は:
+        // - 外部の変更を承知した (`ok.conflict`) なら、そのとき見せた状態
+        // - すでに保存を始めている (`ok.baseline`。確認の画面をはさんだ後) なら、始めたときの状態
+        // - 開いたファイルへの上書きなら、読み込んだときの状態
+        // - それ以外 (新規・名前を付けて保存) は、保存先を選んだときに見えている状態
+        //   (保存先が無ければ「存在しない」。書くまでの間に作られていないこと)
+        // 確認の画面 (文字コードの警告など) の後でも、この状態を取り直さずに持ち回る。
+        // 取り直すと、確認を待っている間に他のプログラムが作った・変えたファイルを、
+        // 気づかずに承知したことにして上書きしてしまう。
+        // 違っていれば確認し直す。実際に置き換える直前にも `atomic_write` が確かめる
+        let current = fileio::fingerprint(&path);
+        let expected = match (&ok.conflict, &ok.baseline) {
+            (Some(seen), _) => seen.clone(),
+            (None, Some(b)) => b.clone(),
+            (None, None) => match (same_file, &d.fingerprint) {
+                (true, Some(fp)) => Some(fp.clone()),
+                _ => current.clone(),
+            },
+        };
+        // 前回の保存の直後に、保存先を確かめられなかった (指紋が当てにならない) とき
+        let unverified =
+            ok.conflict.is_none() && ok.baseline.is_none() && same_file && d.disk_unverified;
+        if unverified || current != expected {
+            self.modals.push_back(Modal::Conflict {
+                id,
+                path,
+                then,
+                ok: Confirmed {
+                    conflict: None,
+                    baseline: None,
+                    ..ok
+                },
+                seen: current,
+            });
+            return false;
+        }
+        let ok = Confirmed {
+            baseline: Some(expected.clone()),
+            ..ok
+        };
         // 元のファイルへの上書きでは、デコードできなかったバイトが失われる
         if same_file && d.lossy_load && !ok.lossy_load {
             self.modals.push_back(Modal::LossyLoad {
@@ -1685,45 +1812,7 @@ impl App {
             });
             return false;
         }
-        // 保存先が、ユーザーが承知した状態のままか。
-        // - 外部の変更を承知した (`ok.conflict`) なら、そのとき見せた状態のまま
-        // - 開いたファイルへの上書きなら、読み込んだときの状態のまま
-        // - それ以外 (新規・名前を付けて保存) は、いま見えている状態のまま
-        //   (保存先が無ければ、書くまでの間に作られていないこと)
-        // 違っていれば確認し直す。実際に置き換える直前にも `atomic_write` が確かめる
-        let current = fileio::fingerprint(&path);
-        let expect = match (&ok.conflict, same_file, &d.fingerprint) {
-            (Some(seen), _, _) => {
-                if *seen != current {
-                    self.modals.push_back(Modal::Conflict {
-                        id,
-                        path,
-                        then,
-                        ok: Confirmed {
-                            conflict: None,
-                            ..ok
-                        },
-                        seen: current,
-                    });
-                    return false;
-                }
-                fileio::Expect::Is(seen.clone())
-            }
-            (None, true, Some(fp)) => {
-                if current.as_ref() != Some(fp) {
-                    self.modals.push_back(Modal::Conflict {
-                        id,
-                        path,
-                        then,
-                        ok,
-                        seen: current,
-                    });
-                    return false;
-                }
-                fileio::Expect::Is(Some(fp.clone()))
-            }
-            _ => fileio::Expect::Is(current),
-        };
+        let expect = fileio::Expect::Is(expected);
         let out = encoding::apply_eol(&d.text, d.eol);
         let (bytes, lossy) = encoding::encode(&out, d.enc);
         drop(out);
@@ -1761,8 +1850,8 @@ impl App {
         } else {
             None
         };
-        match fileio::atomic_write(&path, &bytes, &expect) {
-            Ok(()) => {}
+        let written = match fileio::atomic_write(&path, &bytes, &expect) {
+            Ok(w) => w,
             Err(fileio::WriteError::Conflict) => {
                 // 確認してから書くまでの間に、保存先がまた変わった。何も書き換えていない
                 self.modals.push_back(Modal::Conflict {
@@ -1771,6 +1860,7 @@ impl App {
                     then,
                     ok: Confirmed {
                         conflict: None,
+                        baseline: None,
                         ..ok
                     },
                     seen: fileio::fingerprint(&path),
@@ -1786,21 +1876,35 @@ impl App {
                 )));
                 return false;
             }
-        }
+        };
 
         // ここから先は失敗しない処理だけ
         let d = &mut self.docs[idx];
         d.path = Some(path.clone());
-        d.fingerprint = fileio::fingerprint(&path);
+        let mut note = String::new();
+        match written {
+            fileio::Written::Verified(fp) => {
+                d.fingerprint = Some(fp);
+                d.disk_unverified = false;
+            }
+            fileio::Written::Unverified => {
+                // 他のプログラムが置き換えの直後に差し替えた可能性がある。その版の指紋を
+                // 「自分が書いたもの」として覚えると、次の保存で気づかずに上書きしてしまう
+                d.fingerprint = None;
+                d.disk_unverified = true;
+                note.push_str(
+                    " ※保存の直後にファイルが変わった可能性があります (次の保存の前に確認します)",
+                );
+            }
+        }
         d.lossy_load = false;
         d.mixed_eol = false;
-        let mut note = String::new();
         if let Some((p, cur)) = prepared {
             p.apply(ctx, editor_id(d.id), &mut d.text);
             d.edited();
             d.cursor_idx = cur;
             d.line_col = line_col(&d.text, cur);
-            note = " ※一部の文字は保存形式に合わせて変わりました (Ctrl+Z で戻せます)".into();
+            note.push_str(" ※一部の文字は保存形式に合わせて変わりました (Ctrl+Z で戻せます)");
         }
         d.meta_changed();
         d.mark_saved();
@@ -1869,7 +1973,7 @@ impl App {
             self.status = "読み込み中です".into();
             return;
         }
-        let key = fileio::path_key(&path);
+        let key = fileio::FileKey::of(&path);
         let generation = self.docs[i].generation;
         self.start_load(
             path,
@@ -1988,7 +2092,12 @@ impl App {
         ctx.request_repaint();
     }
 
-    /// 選択中の一致を置換して次へ進む。選択が一致箇所でなければ、まず次の一致へ移動する
+    /// 選択中の一致を置換して次へ進む。
+    ///
+    /// 仕様 (一致の件数にかかわらず同じ): 選択範囲の文字列そのものが検索語に一致する
+    /// (大文字小文字の区別の設定に従う) なら、その選択範囲を置換する。そうでなければ、
+    /// 置換せずに次の一致へ移動する。一致の一覧 (件数に上限がある) は参照しないので、
+    /// 手で選択した範囲でも、上限を超える件数の文書でも、挙動は変わらない
     fn replace_one(&mut self, ctx: &egui::Context) {
         if self.find.query.is_empty() {
             self.status = "検索語を入力してください".into();
@@ -1998,15 +2107,11 @@ impl App {
         let query = self.find.query.clone();
         let repl = self.find.replacement.clone();
         let d = &mut self.docs[self.active];
-        d.ensure_matches(&query, cs);
         let id = editor_id(d.id);
         let (sel_s, sel_e) = editor_sel(ctx, id).unwrap_or((d.cursor_idx, d.cursor_idx));
         let bs = search::char_to_byte(&d.text, sel_s);
         let be = search::char_to_byte(&d.text, sel_e);
-        // 一覧にある一致か。一覧が上限で打ち切られているときは、選択そのものが一致かも調べる
-        let capped = d.find_cache.as_ref().is_some_and(|c| c.capped);
-        let is_match = search::exact_index(d.matches(), sel_s, sel_e).is_some()
-            || (capped && search::is_exact_match(&d.text, bs, be, &query, cs));
+        let is_match = search::is_exact_match(&d.text, bs, be, &query, cs);
         if !is_match {
             self.find_jump(ctx, true);
             return;
@@ -2097,6 +2202,38 @@ impl App {
         self.focus_editor = true;
         self.status = format!("{} 件を置換しました (Ctrl+Z で元に戻せます)", n);
         ctx.request_repaint();
+    }
+
+    /// 選択中の文書に対する操作か (宛先の文書を固定して実行するもの)
+    fn targets_active(act: &Action) -> bool {
+        matches!(
+            act,
+            Action::Save
+                | Action::SaveAs
+                | Action::CloseActive
+                | Action::NextTab
+                | Action::PrevTab
+                | Action::Reload(_)
+                | Action::Convert(_)
+                | Action::SetEol(_)
+                | Action::OpenFind(_)
+                | Action::FindNext
+                | Action::FindPrev
+                | Action::ReplaceOne
+                | Action::ReplaceAll
+        )
+    }
+
+    /// 操作を `owner` (操作を集めた時点の選択中の文書) に対して実行する。
+    /// その文書がもう無ければ (閉じられた) 何もしない
+    fn run_for(&mut self, ctx: &egui::Context, owner: u64, act: Action) {
+        if Self::targets_active(&act) {
+            match self.index_of(owner) {
+                Some(i) => self.active = i,
+                None => return,
+            }
+        }
+        self.run(ctx, act);
     }
 
     fn run(&mut self, ctx: &egui::Context, act: Action) {
@@ -2544,7 +2681,7 @@ impl App {
             let deferred = apply_auto_indent(ui.ctx(), id, &d.text);
             if !deferred.is_empty() {
                 // 本文を書き換える入力の後ろの Enter は、次のフレームで (更新後の本文で) 処理する
-                self.deferred_events = deferred;
+                self.deferred_events = Some((d.id, deferred));
                 ui.ctx().request_repaint();
             }
         }
@@ -2711,6 +2848,11 @@ impl App {
             // キャッシュは版で判定するので、次の描画で作り直される
             d.edited();
             d.update_dirty();
+            // 文書が大きくなって履歴の件数の段階が下がったら、履歴を作り直す
+            let want = undo_limit(d.text.len());
+            if want < recorded_undo_limit(ui.ctx(), id) {
+                shrink_undo_history(ui.ctx(), id, &d.text, want);
+            }
             ui.ctx().request_repaint();
         }
     }
@@ -2785,15 +2927,20 @@ fn line_col(text: &str, char_idx: usize) -> (usize, usize) {
 }
 
 impl eframe::App for App {
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         let time = raw_input.time.unwrap_or(0.0);
         self.ime_guard.filter(time, &mut raw_input.events);
         normalize_text_events(&mut raw_input.events);
         // 前のフレームで持ち越した入力 (自動インデントの Enter など) を先頭へ戻す。
-        // すでに ImeGuard を通っているので、もう一度は通さない
-        if !self.deferred_events.is_empty() {
-            let deferred = std::mem::take(&mut self.deferred_events);
-            raw_input.events.splice(0..0, deferred);
+        // すでに ImeGuard を通っているので、もう一度は通さない。
+        // 宛先の文書がもう選択中・フォーカス中でなければ (タブの切り替えなど)、
+        // 別の文書へ入力が流れ込むのを避けて捨てる
+        if let Some((doc_id, deferred)) = self.deferred_events.take() {
+            let still_target = self.docs.get(self.active).is_some_and(|d| d.id == doc_id)
+                && ctx.memory(|m| m.has_focus(editor_id(doc_id)));
+            if still_target {
+                raw_input.events.splice(0..0, deferred);
+            }
         }
     }
 
@@ -2843,6 +2990,10 @@ impl App {
             self.ime_guard.segs.clear();
         }
         let mut acts = extra;
+        // このフレームで集める操作 (保存・置換・文字コードの変更など、選択中の文書に対する操作)
+        // の宛先は、フレームの最初に選択していた文書。操作を実行するときに、
+        // 「そのときの選択中」ではなく、この文書へ向ける (`run_for`)
+        let owner = self.docs[self.active].id;
 
         // ウィンドウへのドラッグ&ドロップで開く
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -2900,16 +3051,24 @@ impl App {
             ui.add_enabled_ui(enabled, |ui| self.editor(ui));
         });
 
+        // 画面の操作・ショートカットは、読み込みの取り込みより先に実行する。取り込みで選択中の
+        // タブが切り替わると、同じフレームの Ctrl+S や「すべて置換」が、新しく開いたタブへ
+        // 向いてしまうため (宛先もフレームの最初の文書に固定してある)
+        for a in acts {
+            self.run_for(ctx, owner, a);
+        }
+
         // バックグラウンドの読み込みが終わっていれば取り込む。編集欄の処理の後に行う
         // (フレームの最初に行うと、このフレームの入力が、取り込みで切り替わった新しいタブへ届く)
         self.poll_loads(ctx);
 
+        // 確認の画面の答えは、文書の id を持っているので、取り込みの後でよい
         if let Some(m) = self.modals.front().cloned() {
-            self.show_modal(ctx, m, &mut acts);
-        }
-
-        for a in acts {
-            self.run(ctx, a);
+            let mut modal_acts = Vec::new();
+            self.show_modal(ctx, m, &mut modal_acts);
+            for a in modal_acts {
+                self.run(ctx, a);
+            }
         }
 
         // 本文や保存形式を変える操作がすべて終わったので、未保存の文書があるか確かめる。
@@ -3548,6 +3707,39 @@ mod undo_tests {
         assert_eq!(count_enter_presses(&evs), 1);
     }
 
+    /// 確定 → Enter の離した通知 (確定の Enter の押下はアプリに届かなかった) → 次の Enter:
+    /// 離した通知で、確定の後の Enter 用に残っていた取り除く権利が使い切られるので、
+    /// 次の Enter (猶予の間でも、同じフレームでも) は本物の改行
+    #[test]
+    fn ime_release_expires_unused_post_commit_budget() {
+        use egui::ImeEvent::*;
+        let ime = |e: egui::ImeEvent| egui::Event::Ime(e);
+        // 離した通知の後の別のフレームの Enter
+        let mut g = ImeGuard::default();
+        g.filter(1.0, &mut vec![ime(Enabled), ime(Preedit("あ".into()))]);
+        g.filter(1.01, &mut vec![ime(Disabled), ime(Commit("あ".into()))]);
+        let mut evs = vec![enter_release()];
+        g.filter(1.02, &mut evs);
+        assert_eq!(evs.len(), 1, "離した通知は通す");
+        let mut evs = vec![enter()];
+        g.filter(1.03, &mut evs);
+        assert_eq!(count_enter_presses(&evs), 1, "次の Enter は本物");
+        // 離した通知と Enter が同じフレーム
+        let mut g = ImeGuard::default();
+        g.filter(2.0, &mut vec![ime(Enabled), ime(Preedit("あ".into()))]);
+        g.filter(2.01, &mut vec![ime(Disabled), ime(Commit("あ".into()))]);
+        let mut evs = vec![enter_release(), enter()];
+        g.filter(2.02, &mut evs);
+        assert_eq!(count_enter_presses(&evs), 1);
+        // 離した通知が無ければ、従来どおり確定の直後の Enter を 1 回だけ取り除く
+        let mut g = ImeGuard::default();
+        g.filter(3.0, &mut vec![ime(Enabled), ime(Preedit("あ".into()))]);
+        g.filter(3.01, &mut vec![ime(Disabled), ime(Commit("あ".into()))]);
+        let mut evs = vec![enter()];
+        g.filter(3.02, &mut evs);
+        assert_eq!(count_enter_presses(&evs), 0);
+    }
+
     /// 確定 → (遅れて届く) Enter → 離した通知 → 次の Enter: 最後の Enter は本物の改行
     #[test]
     fn ime_late_confirm_enter_then_release_then_real_enter() {
@@ -3788,6 +3980,42 @@ mod undo_tests {
         h.frame(0.05, vec![egui::Event::Text("  ".into()), enter()]);
         h.frame(0.05, vec![]);
         assert_eq!(h.text, "  \n  ");
+    }
+
+    fn key_down(key: Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    /// 同じフレームで、キャレットを動かす入力 (矢印キー) の後に Enter が来ても、
+    /// 動いた後の行のインデントを使う (Enter とその後ろは次のフレームへ持ち越される)
+    #[test]
+    fn auto_indent_sees_caret_moved_earlier_in_the_frame() {
+        let mut h = Harness::with_indent("  a\nb");
+        h.select(5, 5); // 2 行目 "b" の末尾 (インデントなし)
+        h.frame(0.05, vec![key_down(Key::ArrowUp), enter()]);
+        assert_eq!(h.deferred.len(), 1, "Enter は持ち越される");
+        h.frame(0.05, vec![]);
+        // 1 行目 ("  a") の、キャレットの位置までのインデント (空白 1 つ) が引き継がれる
+        assert_eq!(h.text, " \n  a\nb");
+        assert!(h.deferred.is_empty());
+        // Home → Enter も同様 (Home 後の位置は行頭 = インデントなし)
+        let mut h = Harness::with_indent("  a");
+        h.select(3, 3);
+        h.frame(0.05, vec![key_down(Key::Home), enter()]);
+        h.frame(0.05, vec![]);
+        assert_eq!(h.text, "\n  a");
+        // 矢印キーだけの後ろの Enter でなければ、これまでどおり同じフレームで処理される
+        let mut h = Harness::with_indent("  a");
+        h.select(3, 3);
+        h.frame(0.05, vec![enter()]);
+        assert!(h.deferred.is_empty());
+        assert_eq!(h.text, "  a\n  ");
     }
 
     /// 複数行を貼り付けた直後の Enter は、貼り付けた最後の行のインデントを使う
@@ -5252,5 +5480,306 @@ mod app_tests {
         assert!(g3 > g2);
         app.run(&ctx, Action::Save);
         assert!(app.docs[0].generation > g3);
+    }
+
+    // ---- 第 3 回レビュー
+
+    /// 名前を付けて保存で、文字コードの警告を出している間に他のプログラムが保存先を作ったら、
+    /// 警告に答えた後でも気づかずに上書きせず、確認する (保存先を選んだ時点の状態を持ち回る)
+    #[test]
+    fn save_as_expectation_survives_lossy_warning() {
+        let t = Tmp::new();
+        let mut app = app();
+        let ctx = app.ctx.clone();
+        app.docs[0].enc = Enc::Legacy(encoding_rs::SHIFT_JIS);
+        edit(&mut app, 0, |s| s.push('\u{a5}'));
+        let target = t.0.join("B.txt");
+        // 保存先は存在しない。文字コードの警告が出る
+        assert!(!app.write_doc(&ctx, 0, target.clone(), Then::None, Confirmed::default()));
+        assert!(matches!(app.modal(), Some(Modal::Lossy { .. })));
+        // 警告を出している間に、他のプログラムが保存先を作る
+        std::fs::write(&target, b"theirs").unwrap();
+        confirm(&mut app); // 「それでも保存」
+        assert!(
+            matches!(app.modal(), Some(Modal::Conflict { .. })),
+            "確認し直す: {:?}",
+            app.status
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"theirs", "上書きしない");
+        assert!(app.docs[0].dirty);
+        // 新しい状態を承知して上書きすれば保存できる (文字コードの警告には答え済み)
+        confirm(&mut app);
+        assert!(app.modal().is_none(), "{:?}", app.status);
+        assert_eq!(std::fs::read(&target).unwrap(), [0x5C]);
+        assert!(!app.docs[0].dirty);
+    }
+
+    /// 同じく、他のプログラムが保存先を更新した場合 (すでにある保存先を選んだとき)
+    #[test]
+    fn save_as_existing_target_updated_during_warning_asks_again() {
+        let t = Tmp::new();
+        let target = t.file("B.txt", b"old");
+        let mut app = app();
+        let ctx = app.ctx.clone();
+        app.docs[0].enc = Enc::Legacy(encoding_rs::SHIFT_JIS);
+        edit(&mut app, 0, |s| s.push('\u{a5}'));
+        assert!(!app.write_doc(&ctx, 0, target.clone(), Then::None, Confirmed::default()));
+        assert!(matches!(app.modal(), Some(Modal::Lossy { .. })));
+        std::fs::write(&target, b"updated by another program").unwrap();
+        confirm(&mut app);
+        assert!(matches!(app.modal(), Some(Modal::Conflict { .. })));
+        assert_eq!(std::fs::read(&target).unwrap(), b"updated by another program");
+    }
+
+    /// 保存の直後に保存先を確かめられなかったとき (`disk_unverified`) は、次の保存の前に確認する
+    #[test]
+    fn unverified_disk_state_asks_before_next_save() {
+        let t = Tmp::new();
+        let p = t.file("f.txt", b"one");
+        let mut app = app();
+        open(&mut app, &p);
+        let ctx = app.ctx.clone();
+        edit(&mut app, 0, |s| s.push('!'));
+        app.docs[0].fingerprint = None;
+        app.docs[0].disk_unverified = true;
+        app.run(&ctx, Action::Save);
+        assert!(matches!(app.modal(), Some(Modal::Conflict { .. })));
+        assert_eq!(std::fs::read(&p).unwrap(), b"one");
+        confirm(&mut app);
+        assert_eq!(std::fs::read(&p).unwrap(), b"one!");
+        assert!(!app.docs[0].disk_unverified, "確認して保存すれば元に戻る");
+        assert!(app.docs[0].fingerprint.is_some());
+        // 通常の保存では、保存先の指紋は書いた内容そのもの (確かめられた状態)
+        edit(&mut app, 0, |s| s.push('?'));
+        app.run(&ctx, Action::Save);
+        assert!(app.modal().is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), b"one!?");
+        assert_eq!(app.docs[0].fingerprint, fileio::fingerprint(&p));
+    }
+
+    /// 読み込みが終わるのと同じフレームの Ctrl+S / すべて置換は、元のタブに対して行われる
+    #[test]
+    fn actions_in_completion_frame_target_original_tab() {
+        let t = Tmp::new();
+        let a = t.file("a.txt", b"abc");
+        let b = t.file("b.txt", b"abc");
+        let ctx = egui::Context::default();
+        let mut app = App::blank(ctx.clone());
+        app.open_path(a.clone());
+        wait_loads(&mut app);
+        edit(&mut app, 0, |s| s.push('!'));
+        app.find.query = "b".into();
+        app.find.replacement = "X".into();
+        app.open_path(b.clone());
+        // 読み込みのスレッドが終わるまで待つ (結果の取り込みは、次のフレームの最後に行われる)
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let raw = egui::RawInput {
+            time: Some(1.0),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            app.update_ui_with(ctx, 0, vec![Action::ReplaceAll, Action::Save]);
+        });
+        assert_eq!(std::fs::read(&a).unwrap(), b"aXc!", "A が保存された");
+        assert_eq!(std::fs::read(&b).unwrap(), b"abc", "B は変わらない");
+        assert_eq!(app.docs.len(), 2, "B も取り込まれた");
+        let bi = app.docs.iter().position(|d| d.title() == "b.txt").unwrap();
+        assert_eq!(app.docs[bi].text, "abc");
+        assert!(!app.docs[bi].dirty);
+        assert!(!app.docs[1 - bi].dirty, "A は保存済み");
+    }
+
+    /// 入力を 1 フレーム持ち越す間に読み込みが終わっても、その入力は元のタブへ届く
+    /// (新しいタブは追加だけして、選択しない)
+    #[test]
+    fn deferred_auto_indent_stays_with_its_tab() {
+        let t = Tmp::new();
+        let a = t.file("a.txt", b"  a");
+        let b = t.file("b.txt", b"bbb");
+        let ctx = egui::Context::default();
+        let mut app = App::blank(ctx.clone());
+        let mut clock = 0.0;
+        app.open_path(a);
+        wait_loads(&mut app);
+        for _ in 0..3 {
+            frame(&ctx, &mut app, &mut clock, vec![], false);
+        }
+        let a_id = app.docs[0].id;
+        set_editor_sel(&ctx, editor_id(a_id), 3, 3);
+        frame(&ctx, &mut app, &mut clock, vec![], false);
+        app.open_path(b);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // 文字入力の後ろの Enter は、次のフレームへ持ち越される。同じフレームで B の読み込みが終わる
+        frame_hooked(
+            &ctx,
+            &mut app,
+            &mut clock,
+            vec![egui::Event::Text("b".into()), enter_ev()],
+        );
+        assert_eq!(app.docs.len(), 2, "B も取り込まれた");
+        assert!(matches!(&app.deferred_events, Some((id, _)) if *id == a_id));
+        assert_eq!(app.docs[app.active].id, a_id, "持ち越し中は選択を動かさない");
+        frame_hooked(&ctx, &mut app, &mut clock, vec![]);
+        let ai = app.docs.iter().position(|d| d.id == a_id).unwrap();
+        assert_eq!(app.docs[ai].text, "  ab\n  ", "持ち越した Enter は A へ届く");
+        let bi = 1 - ai;
+        assert_eq!(app.docs[bi].text, "bbb", "B には入らない");
+        // タブが切り替わっていれば、持ち越した入力は捨てる
+        app.deferred_events = Some((a_id, vec![enter_ev()]));
+        app.active = bi;
+        frame_hooked(&ctx, &mut app, &mut clock, vec![]);
+        assert!(app.deferred_events.is_none());
+        assert_eq!(app.docs[bi].text, "bbb");
+        assert_eq!(app.docs[ai].text, "  ab\n  ");
+    }
+
+    fn enter_ev() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    /// `App::raw_input_hook` (持ち越した入力の戻しを含む) を通して 1 フレーム進める
+    fn frame_hooked(
+        ctx: &egui::Context,
+        app: &mut App,
+        t: &mut f64,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        *t += 0.05;
+        let mut raw = egui::RawInput {
+            time: Some(*t),
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        ctx.run(raw, |ctx| app.update_ui(ctx, 0))
+    }
+
+    /// 編集や貼り付けで文書が大きくなったら、Undo 履歴の件数の段階を下げる。
+    /// 貼り付け直前までの最近の履歴は残り、貼り付けは Ctrl+Z で戻せる
+    #[test]
+    fn growing_document_shrinks_undo_limit_and_keeps_recent_history() {
+        // テストでは予算を小さくして、小さな文書で件数が絞られる状況を作る
+        TEST_UNDO_BUDGET.with(|b| b.set(Some(4500)));
+        let ctx = egui::Context::default();
+        let mut app = App::blank(ctx.clone());
+        let id = editor_id(app.docs[0].id);
+        let mut t = 0.0;
+        for _ in 0..3 {
+            frame(&ctx, &mut app, &mut t, vec![], false);
+        }
+        let settle = |ctx: &egui::Context, app: &mut App, t: &mut f64| {
+            for _ in 0..25 {
+                frame(ctx, app, t, vec![], false);
+            }
+        };
+        frame(&ctx, &mut app, &mut t, vec![egui::Event::Text("ab".into())], false);
+        settle(&ctx, &mut app, &mut t);
+        frame(&ctx, &mut app, &mut t, vec![egui::Event::Text(" more".into())], false);
+        settle(&ctx, &mut app, &mut t);
+        assert_eq!(app.docs[0].text, "ab more");
+        assert_eq!(recorded_undo_limit(&ctx, id), 100, "小さな文書は既定の件数");
+        // 大きな文章を貼り付ける
+        let big = "x".repeat(1000);
+        frame(&ctx, &mut app, &mut t, vec![egui::Event::Paste(big.clone())], false);
+        assert_eq!(app.docs[0].text, format!("ab more{big}"));
+        let want = undo_limit(app.docs[0].text.len());
+        assert!(want < 100);
+        assert_eq!(recorded_undo_limit(&ctx, id), want, "段階が下がった");
+        // 履歴の件数は新しい上限以内。貼り付けは 1 回の Ctrl+Z で戻り、その前の状態も残っている
+        let z = || egui::Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        frame(&ctx, &mut app, &mut t, vec![z()], false);
+        assert_eq!(app.docs[0].text, "ab more", "貼り付けが取り消される");
+        frame(&ctx, &mut app, &mut t, vec![z()], false);
+        assert_eq!(app.docs[0].text, "ab", "その前の履歴も残っている");
+        // 履歴の長さは新しい上限を超えない (これ以上遡ると上限で打ち切られる)
+        let mut steps = 2;
+        loop {
+            let before = app.docs[0].text.clone();
+            frame(&ctx, &mut app, &mut t, vec![z()], false);
+            if app.docs[0].text == before {
+                break;
+            }
+            steps += 1;
+            assert!(steps <= want, "{steps} > {want}");
+        }
+        TEST_UNDO_BUDGET.with(|b| b.set(None));
+    }
+
+    /// 履歴を作り直す関数そのもの: 古い状態を新しい上限の件数だけ残す
+    #[test]
+    fn shrink_undo_history_keeps_newest_states() {
+        let ctx = egui::Context::default();
+        let id = editor_id(31);
+        let mut state = TextEditState::default();
+        let mut u = bounded_undoer(100);
+        for i in 0..10 {
+            u.add_undo(&(CCursorRange::one(CCursor::new(0)), format!("state {i}")));
+        }
+        state.set_undoer(u);
+        state.store(&ctx, id);
+        shrink_undo_history(&ctx, id, "current text", 4);
+        assert_eq!(recorded_undo_limit(&ctx, id), 4);
+        let mut u = TextEditState::load(&ctx, id).unwrap().undoer();
+        let mut cur = (CCursorRange::one(CCursor::new(0)), "current text".to_string());
+        let mut seen = Vec::new();
+        while let Some(prev) = u.undo(&cur).cloned() {
+            seen.push(prev.1.clone());
+            cur = prev;
+            assert!(seen.len() < 10);
+        }
+        assert_eq!(seen, ["state 9", "state 8", "state 7"], "最近の 3 件 + 現在の状態");
+    }
+
+    /// 「置換」は、選択範囲の文字列そのものが検索語に一致するなら、その選択範囲を置換する。
+    /// 一致の件数 (一覧の上限) には左右されない
+    #[test]
+    fn replace_one_semantics_do_not_depend_on_match_count() {
+        for n in [6usize, search::MAX_STORED_MATCHES * 2 + 10] {
+            let ctx = egui::Context::default();
+            let mut app = App::blank(ctx.clone());
+            // "aa" は重なって現れる ("aaa" の (1,3) は一覧の (0,2) とは別だが、選択範囲そのものが一致)
+            app.docs[0].text = "a".repeat(n);
+            app.docs[0].edited();
+            app.find.query = "AA".into();
+            app.find.replacement = "Z".into();
+            app.find.case_sensitive = false; // 大文字小文字は区別しない
+            let id = editor_id(app.docs[0].id);
+            set_editor_sel(&ctx, id, 1, 3);
+            app.run(&ctx, Action::ReplaceOne);
+            assert!(app.docs[0].text.starts_with("aZ"), "n = {n}: {}", &app.docs[0].text[..4]);
+            assert_eq!(app.docs[0].text.matches('Z').count(), 1);
+            assert_eq!(app.docs[0].text.len(), n - 1);
+            // 選択が検索語と一致しないときは、置換せずに次の一致へ移動する
+            let before = app.docs[0].text.clone();
+            set_editor_sel(&ctx, id, 0, 1);
+            app.run(&ctx, Action::ReplaceOne);
+            assert_eq!(app.docs[0].text, before, "n = {n}: 置換されない");
+            assert_eq!(editor_sel(&ctx, id), Some((2, 4)), "n = {n}: 次の一致へ移動");
+            // 大文字小文字を区別するときは、一致しない
+            app.find.case_sensitive = true;
+            set_editor_sel(&ctx, id, 2, 4);
+            app.run(&ctx, Action::ReplaceOne);
+            assert_eq!(app.docs[0].text, before, "n = {n}: 区別すれば一致しない");
+        }
     }
 }
