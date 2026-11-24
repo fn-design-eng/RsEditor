@@ -425,6 +425,9 @@ fn paint_preedit_for(
 /// Windows に渡す。winit はその左上を候補ウィンドウの位置、矩形全体を「避ける範囲」に
 /// するため、本文のような大きな欄では候補ウィンドウが欄の外 (画面の端など) に出てしまう。
 /// そこで `rect` を 1 文字分の高さの細い矩形に置き換える。
+/// 候補ウィンドウと文字の間の余白 (ポイント)
+const IME_AREA_GAP: f32 = 4.0;
+
 fn set_ime_area(
     ui: &egui::Ui,
     out: &egui::text_edit::TextEditOutput,
@@ -447,7 +450,11 @@ fn set_ime_area(
     });
     ui.ctx().output_mut(|o| {
         if let Some(ime) = &mut o.ime {
-            ime.rect = area.unwrap_or(ime.cursor_rect);
+            // 候補ウィンドウが文字に密着しないよう、上下に少し余白を足す
+            // (候補ウィンドウはこの矩形を避けて、下か上に出る)
+            ime.rect = area
+                .unwrap_or(ime.cursor_rect)
+                .expand2(egui::vec2(0.0, IME_AREA_GAP));
         }
     });
 }
