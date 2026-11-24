@@ -331,7 +331,7 @@ fn paint_preedit(
                     egui::pos2(r.min.x, r.max.y - 1.0),
                     egui::pos2(r.max.x, r.max.y - 1.0),
                 ],
-                egui::Stroke::new(2.0, accent),
+                egui::Stroke::new(1.5, accent),
             );
         }
         return;
@@ -359,7 +359,7 @@ fn paint_preedit(
                             egui::pos2(r.min.x, r.max.y - 1.0),
                             egui::pos2(x1, r.max.y - 1.0),
                         ],
-                        egui::Stroke::new(2.5, accent),
+                        egui::Stroke::new(1.5, accent),
                     );
                 }
                 Kind::Converted => {
