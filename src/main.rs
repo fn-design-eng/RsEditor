@@ -304,19 +304,28 @@ fn paint_preedit(
     galley_pos: egui::Pos2,
     range: (usize, usize),
     segs: &[ime::Segment],
+    sel_fill: egui::Color32,
+    slot: egui::layers::ShapeIdx,
 ) {
     use ime::Kind;
     let accent = ui.visuals().selection.stroke.color;
     let text_color = ui.visuals().text_color();
-    let alpha =
-        |c: egui::Color32, a: u8| egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
     let painter = ui.painter();
     let off = galley_pos.to_vec2();
     let n = range.1 - range.0;
+    // 背景は TextEdit の表示前に確保したスロットへ入れ、本文の下に描く
+    let mut fills: Vec<egui::Shape> = Vec::new();
+    let set_fills = |fills: Vec<egui::Shape>| painter.set(slot, egui::Shape::Vec(fills));
     if segs.is_empty() || segs.last().map(|s| s.range.end) != Some(n) {
+        // 全体の薄い背景 (選択色の半透明)
+        let tint = sel_fill.gamma_multiply(0.5);
         for r in preedit_rects(galley, range) {
             let r = r.translate(off);
-            painter.rect_filled(r, 0.0, alpha(accent, 40));
+            fills.push(egui::Shape::rect_filled(r, 0.0, tint));
+        }
+        set_fills(fills);
+        for r in preedit_rects(galley, range) {
+            let r = r.translate(off);
             painter.line_segment(
                 [
                     egui::pos2(r.min.x, r.max.y - 1.0),
@@ -340,11 +349,11 @@ fn paint_preedit(
             };
             match seg.kind {
                 Kind::Target => {
-                    painter.rect_filled(
+                    fills.push(egui::Shape::rect_filled(
                         egui::Rect::from_min_max(r.min, egui::pos2(x1, r.max.y)),
                         0.0,
-                        alpha(accent, 90),
-                    );
+                        sel_fill,
+                    ));
                     painter.line_segment(
                         [
                             egui::pos2(r.min.x, r.max.y - 1.0),
@@ -378,6 +387,13 @@ fn paint_preedit(
             }
         }
     }
+    set_fills(fills);
+}
+
+/// TextEdit の表示前に呼び、変換中の背景を入れるスロットを確保する
+/// (後から `paint_preedit` が埋める。本文より前に描かれるので背景は本文の下になる)
+fn reserve_preedit_slot(ui: &egui::Ui) -> egui::layers::ShapeIdx {
+    ui.painter().add(egui::Shape::Noop)
 }
 
 /// TextEdit の出力から、変換中の範囲に下線などを描く
@@ -386,6 +402,8 @@ fn paint_preedit_for(
     out: &egui::text_edit::TextEditOutput,
     composing: bool,
     segs: &[ime::Segment],
+    sel_fill: egui::Color32,
+    slot: egui::layers::ShapeIdx,
 ) {
     if !out.response.has_focus() {
         return;
@@ -395,7 +413,7 @@ fn paint_preedit_for(
         (a.ccursor.index, b.ccursor.index)
     });
     if let Some(r) = preedit_range(composing, sel) {
-        paint_preedit(ui, &out.galley, out.galley_pos, r, segs);
+        paint_preedit(ui, &out.galley, out.galley_pos, r, segs, sel_fill, slot);
     }
 }
 
@@ -408,13 +426,40 @@ fn singleline_with_preedit(
     segs: &[ime::Segment],
 ) -> egui::Response {
     let old = hide_selection_fill(ui, composing);
-    let mut te = egui::TextEdit::singleline(text).desired_width(200.0);
+    // TextEdit は枠 (frame) を自分の show() 冒頭で確保したスロットに描く。そのスロットより
+    // 後ろに背景スロットを置くと、枠の不透明な塗りに隠れてしまう。そこで枠は TextEdit に
+    // 任せず (frame(false))、枠 → 変換中の背景 → 本文 の順になるよう自前で枠を描く。
+    let frame_slot = ui.painter().add(egui::Shape::Noop);
+    let fill_slot = reserve_preedit_slot(ui);
+    let mut te = egui::TextEdit::singleline(text)
+        .desired_width(200.0)
+        .frame(false);
     if let Some(id) = id {
         te = te.id(id);
     }
     let out = te.show(ui);
     ui.visuals_mut().selection.bg_fill = old;
-    paint_preedit_for(ui, &out, composing, segs);
+    // egui 0.29 の TextEdit 既定の余白 Margin::symmetric(4.0, 2.0) を戻した外側の矩形
+    let frame_rect = {
+        let visuals = ui.style().interact(&out.response);
+        out.response
+            .rect
+            .expand2(egui::vec2(4.0, 2.0))
+            .expand(visuals.expansion)
+    };
+    let (rounding, stroke) = {
+        let visuals = ui.style().interact(&out.response);
+        if out.response.has_focus() {
+            (visuals.rounding, ui.visuals().selection.stroke)
+        } else {
+            (visuals.rounding, visuals.bg_stroke)
+        }
+    };
+    ui.painter().set(
+        frame_slot,
+        egui::epaint::RectShape::new(frame_rect, rounding, ui.visuals().extreme_bg_color, stroke),
+    );
+    paint_preedit_for(ui, &out, composing, segs, old, fill_slot);
     out.response
 }
 
@@ -1428,6 +1473,7 @@ impl App {
                         ui.fonts(|f| f.layout_job(job))
                     };
                     let old_fill = hide_selection_fill(ui, composing);
+                    let fill_slot = reserve_preedit_slot(ui);
                     let out = egui::TextEdit::multiline(&mut d.text)
                         .id(id)
                         .frame(false)
@@ -1441,7 +1487,7 @@ impl App {
                         .layouter(&mut layouter)
                         .show(ui);
                     ui.visuals_mut().selection.bg_fill = old_fill;
-                    paint_preedit_for(ui, &out, composing, &segs);
+                    paint_preedit_for(ui, &out, composing, &segs, old_fill, fill_slot);
                     if out.response.changed() {
                         d.dirty = true;
                         d.rev += 1;
