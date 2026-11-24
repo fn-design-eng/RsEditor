@@ -159,6 +159,61 @@ fn replace_text_with_undo(
     state.store(ctx, id);
 }
 
+/// 自動インデント: 選択範囲 `sel` (文字位置, 昇順) を「改行 + 現在行のインデント」で置き換えた
+/// 本文と、挿入後のキャレット位置 (文字位置) を返す。
+///
+/// インデントは現在行の行頭にある空白・タブを (キャレットより手前の分だけ) そのまま写す。
+/// 本文は常に "\n" 区切り (読み込み時に正規化し、保存時に改行コードへ戻す)。
+fn indent_newline(text: &str, sel: (usize, usize)) -> (String, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let s = sel.0.min(chars.len());
+    let e = sel.1.clamp(s, chars.len());
+    let line_start = chars[..s].iter().rposition(|&c| c == '\n').map_or(0, |p| p + 1);
+    let indent: String = chars[line_start..s]
+        .iter()
+        .take_while(|&&c| c == ' ' || c == '\t')
+        .collect();
+    let mut out: String = chars[..s].iter().collect();
+    out.push('\n');
+    out.push_str(&indent);
+    out.extend(&chars[e..]);
+    (out, s + 1 + indent.chars().count())
+}
+
+/// 編集欄にフォーカスがあるとき、Enter (Ctrl/Alt なし。Shift 付きも含む) の押下を入力から取り除き、
+/// 代わりに自動インデント付きの改行を挿入する。挿入した場合は true を返す。
+///
+/// egui 自身の改行処理に任せると Undo が「改行」と「インデント」に分かれてしまうため、
+/// `replace_text_with_undo` で前後の状態を履歴に積み、Ctrl+Z 1 回で両方が戻るようにする。
+/// IME の確定 Enter は `ImeGuard` が先に取り除くので、ここへは届かない。
+fn apply_auto_indent(ctx: &egui::Context, id: egui::Id, text: &mut String) -> bool {
+    if !ctx.memory(|m| m.has_focus(id)) {
+        return false;
+    }
+    let is_enter = |e: &egui::Event| {
+        matches!(e, egui::Event::Key { key: Key::Enter, pressed: true, modifiers, .. }
+            if !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.mac_cmd)
+    };
+    let count = ctx.input(|i| i.events.iter().filter(|e| is_enter(e)).count());
+    if count == 0 {
+        return false;
+    }
+    let Some(range) = TextEditState::load(ctx, id).and_then(|s| s.cursor.char_range()) else {
+        return false; // 状態がまだ無いときは egui の通常の改行に任せる
+    };
+    ctx.input_mut(|i| i.events.retain(|e| !is_enter(e)));
+    let [a, b] = range.sorted();
+    let mut sel = (a.index, b.index);
+    let mut new_text = text.clone();
+    for _ in 0..count {
+        let (t, caret) = indent_newline(&new_text, sel);
+        new_text = t;
+        sel = (caret, caret);
+    }
+    replace_text_with_undo(ctx, id, text, new_text, sel);
+    true
+}
+
 /// 一致箇所の背景を付けた LayoutJob 用のセクションを作る。全体を隙間なく覆うように並べる
 fn highlight_sections(
     text: &str,
@@ -192,6 +247,98 @@ fn highlight_sections(
         out.push(section(pos..text.len(), egui::Color32::TRANSPARENT));
     }
     out
+}
+
+/// 変換中 (未確定) の文字範囲 (文字位置, 昇順)。
+///
+/// egui 0.29 の TextEdit は、Preedit の文字列を本文へ実際に挿入して選択状態にする
+/// (次の Preedit で置き換えるため、この選択を保つ必要がある)。そのため変換中は
+/// 「選択範囲 = 未確定文字列」になる。egui-winit は winit の文節情報を捨てるので、
+/// 文節ごとの区別はできず、未確定文字列全体を 1 つの範囲として扱う。
+fn preedit_range(composing: bool, sel: Option<(usize, usize)>) -> Option<(usize, usize)> {
+    sel.filter(|&(a, b)| composing && a < b)
+}
+
+/// 変換中は通常の選択色を消す (未確定文字列を選択範囲に見せず、下線と淡い背景で示すため)。
+/// 戻り値は元の色で、描画後に `selection.bg_fill` へ戻す
+fn hide_selection_fill(ui: &mut egui::Ui, composing: bool) -> egui::Color32 {
+    let old = ui.visuals().selection.bg_fill;
+    if composing {
+        ui.visuals_mut().selection.bg_fill = egui::Color32::TRANSPARENT;
+    }
+    old
+}
+
+/// 未確定文字列の各表示行での範囲 (galley 内の座標)。折り返し・複数行にも対応する
+fn preedit_rects(galley: &egui::Galley, range: (usize, usize)) -> Vec<egui::Rect> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    for row in &galley.rows {
+        let len = row.char_count_excluding_newline();
+        let (a, b) = (range.0.max(offset), range.1.min(offset + len));
+        if a < b {
+            let (x0, x1) = (row.x_offset(a - offset), row.x_offset(b - offset));
+            out.push(egui::Rect::from_min_max(
+                egui::pos2(row.rect.min.x + x0, row.rect.min.y),
+                egui::pos2(row.rect.min.x + x1, row.rect.max.y),
+            ));
+        }
+        offset += row.char_count_including_newline();
+    }
+    out
+}
+
+/// 未確定文字列に、淡い背景と 2px の下線を重ねて描く
+fn paint_preedit(
+    ui: &egui::Ui,
+    galley: &egui::Galley,
+    galley_pos: egui::Pos2,
+    range: (usize, usize),
+) {
+    let accent = ui.visuals().selection.stroke.color;
+    let tint = egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 40);
+    let painter = ui.painter();
+    for r in preedit_rects(galley, range) {
+        let r = r.translate(galley_pos.to_vec2());
+        painter.rect_filled(r, 0.0, tint);
+        let y = r.max.y - 1.0;
+        painter.line_segment(
+            [egui::pos2(r.min.x, y), egui::pos2(r.max.x, y)],
+            egui::Stroke::new(2.0, accent),
+        );
+    }
+}
+
+/// TextEdit の出力から、変換中の範囲に下線などを描く
+fn paint_preedit_for(ui: &egui::Ui, out: &egui::text_edit::TextEditOutput, composing: bool) {
+    if !out.response.has_focus() {
+        return;
+    }
+    let sel = out.cursor_range.map(|c| {
+        let [a, b] = c.sorted_cursors();
+        (a.ccursor.index, b.ccursor.index)
+    });
+    if let Some(r) = preedit_range(composing, sel) {
+        paint_preedit(ui, &out.galley, out.galley_pos, r);
+    }
+}
+
+/// 1 行の入力欄 (検索・置換) を、変換中の表示付きで出す
+fn singleline_with_preedit(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    id: Option<egui::Id>,
+    composing: bool,
+) -> egui::Response {
+    let old = hide_selection_fill(ui, composing);
+    let mut te = egui::TextEdit::singleline(text).desired_width(200.0);
+    if let Some(id) = id {
+        te = te.id(id);
+    }
+    let out = te.show(ui);
+    ui.visuals_mut().selection.bg_fill = old;
+    paint_preedit_for(ui, &out, composing);
+    out.response
 }
 
 #[derive(Clone)]
@@ -231,6 +378,53 @@ enum Action {
     ReplaceAll,
 }
 
+/// IME の変換確定 (Enter) が改行や「次を検索」として二重に処理されるのを防ぐ。
+///
+/// 原因: Windows の winit は、IME が処理中のキー入力を論理キー `Named(Process)` として
+/// 通知する。egui-winit 0.29 はこれを `None` とみなし、物理キー (Enter) へフォールバックして
+/// `Event::Key { key: Enter }` を発行してしまう。そのため確定の Enter が
+/// `Event::Ime(Commit)` と別に TextEdit へ届き、改行が入る。
+/// 対策: 変換中、および確定直後の Enter の押下イベントを入力から取り除く。
+#[derive(Default)]
+struct ImeGuard {
+    /// 変換中 (未確定文字列がある) か
+    composing: bool,
+    /// 直近の Commit の時刻 (egui の time)
+    last_commit: Option<f64>,
+}
+
+impl ImeGuard {
+    /// 確定の Enter が Commit の前後どちらに来ても取り除くための猶予 (秒)
+    const GRACE: f64 = 0.05;
+
+    fn filter(&mut self, time: f64, events: &mut Vec<egui::Event>) {
+        events.retain(|e| match e {
+            egui::Event::Ime(egui::ImeEvent::Preedit(t)) => {
+                self.composing = !t.is_empty();
+                true
+            }
+            egui::Event::Ime(egui::ImeEvent::Commit(_)) => {
+                self.composing = false;
+                self.last_commit = Some(time);
+                true
+            }
+            egui::Event::Ime(egui::ImeEvent::Disabled) => {
+                self.composing = false;
+                true
+            }
+            egui::Event::Key {
+                key: Key::Enter,
+                pressed: true,
+                ..
+            } => {
+                let after_commit = self.last_commit.is_some_and(|c| time - c <= Self::GRACE);
+                !(self.composing || after_commit)
+            }
+            _ => true,
+        });
+    }
+}
+
 struct App {
     docs: Vec<Doc>,
     active: usize,
@@ -241,7 +435,10 @@ struct App {
     font_size: f32,
     wrap: bool,
     show_line_numbers: bool,
+    /// Enter で現在行のインデントを引き継ぐか
+    auto_indent: bool,
     allow_exit: bool,
+    ime_guard: ImeGuard,
     focus_editor: bool,
     last_title: String,
     find: FindState,
@@ -262,7 +459,9 @@ impl App {
             font_size: 15.0,
             wrap: true,
             show_line_numbers: true,
+            auto_indent: true,
             allow_exit: false,
+            ime_guard: ImeGuard::default(),
             focus_editor: true,
             last_title: String::new(),
             find: FindState::default(),
@@ -885,6 +1084,7 @@ impl App {
             ui.menu_button("表示", |ui| {
                 ui.checkbox(&mut self.wrap, "右端で折り返す");
                 ui.checkbox(&mut self.show_line_numbers, "行番号を表示");
+                ui.checkbox(&mut self.auto_indent, "自動インデント");
                 ui.add(egui::Slider::new(&mut self.font_size, 8.0..=40.0).text("文字サイズ"));
                 ui.separator();
                 let mut dark = ui.ctx().style().visuals.dark_mode;
@@ -960,6 +1160,7 @@ impl App {
     /// 検索・置換バー (開いているときだけ表示)
     fn find_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Action>) {
         let qid = egui::Id::new("find_query");
+        let composing = self.ime_guard.composing;
         // 検索欄にフォーカスがあるときの Enter / Shift+Enter。欄に入力させないよう先に取り除く
         // (Shift を含む組み合わせを先に判定する。consume_key は余分な Shift を無視するため)
         if ui.memory(|m| m.has_focus(qid)) {
@@ -991,11 +1192,7 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.label("検索:");
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.find.query)
-                    .id(qid)
-                    .desired_width(200.0),
-            );
+            let r = singleline_with_preedit(ui, &mut self.find.query, Some(qid), composing);
             if std::mem::take(&mut self.find.focus_query) {
                 r.request_focus();
             }
@@ -1021,7 +1218,7 @@ impl App {
         if self.find.show_replace {
             ui.horizontal(|ui| {
                 ui.label("置換:");
-                ui.add(egui::TextEdit::singleline(&mut self.find.replacement).desired_width(200.0));
+                singleline_with_preedit(ui, &mut self.find.replacement, None, composing);
                 if ui
                     .button("置換")
                     .on_hover_text("現在の一致を置換して次へ")
@@ -1064,10 +1261,18 @@ impl App {
         let find_on = self.find.open && !self.find.query.is_empty();
         let cs = self.find.case_sensitive;
         let dark = ui.visuals().dark_mode;
+        let composing = self.ime_guard.composing;
+        let auto_indent = self.auto_indent;
         let d = &mut self.docs[self.active];
         let id = editor_id(d.id);
         if focus {
             ui.memory_mut(|m| m.request_focus(id));
+        }
+        // 自動インデント付きの改行 (egui の TextEdit が処理する前に Enter を取り除いて挿入する)
+        let indented = auto_indent && !composing && apply_auto_indent(ui.ctx(), id, &mut d.text);
+        if indented {
+            d.dirty = true;
+            d.rev += 1;
         }
         if find_on {
             // 文書や検索語が変わったときだけ一致を数え直す
@@ -1136,6 +1341,7 @@ impl App {
                         }
                         ui.fonts(|f| f.layout_job(job))
                     };
+                    let old_fill = hide_selection_fill(ui, composing);
                     let out = egui::TextEdit::multiline(&mut d.text)
                         .id(id)
                         .frame(false)
@@ -1148,15 +1354,25 @@ impl App {
                         .min_size(ui.available_size())
                         .layouter(&mut layouter)
                         .show(ui);
+                    ui.visuals_mut().selection.bg_fill = old_fill;
+                    paint_preedit_for(ui, &out, composing);
                     if out.response.changed() {
                         d.dirty = true;
                         d.rev += 1;
                     }
                     if let Some(cr) = out.cursor_range {
                         let idx = cr.primary.ccursor.index;
-                        if idx != d.cursor_idx || out.response.changed() {
+                        if idx != d.cursor_idx || out.response.changed() || indented {
                             d.cursor_idx = idx;
                             d.line_col = line_col(&d.text, idx);
+                        }
+                        // 通常の Enter と同様にキャレットが見えるようにスクロールする
+                        if indented {
+                            let rect = out
+                                .galley
+                                .pos_from_cursor(&cr.primary)
+                                .translate(out.galley_pos.to_vec2());
+                            ui.scroll_to_rect(rect, None);
                         }
                     }
 
@@ -1223,6 +1439,11 @@ fn line_col(text: &str, char_idx: usize) -> (usize, usize) {
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let time = raw_input.time.unwrap_or(0.0);
+        self.ime_guard.filter(time, &mut raw_input.events);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut acts = Vec::new();
 
@@ -1449,10 +1670,21 @@ mod undo_tests {
         text: String,
         field: String,
         t: f64,
+        /// 自動インデントを有効にするか (アプリの `editor` と同じ呼び出しを再現する)
+        auto_indent: bool,
     }
 
     fn ed() -> egui::Id {
         editor_id(1)
+    }
+    fn enter() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
     }
     fn field() -> egui::Id {
         egui::Id::new("field")
@@ -1465,7 +1697,20 @@ mod undo_tests {
                 text: text.into(),
                 field: String::new(),
                 t: 0.0,
+                auto_indent: false,
             }
+        }
+        fn with_indent(text: &str) -> Self {
+            Harness {
+                auto_indent: true,
+                ..Harness::new(text)
+            }
+        }
+        /// 本文にフォーカスを置き、選択範囲を設定して反映させる
+        fn select(&mut self, a: usize, b: usize) {
+            self.focus(ed());
+            set_editor_sel(&self.ctx, ed(), a, b);
+            self.frame(0.05, vec![]);
         }
         fn frame(&mut self, dt: f64, events: Vec<egui::Event>) {
             self.t += dt;
@@ -1478,10 +1723,13 @@ mod undo_tests {
                 )),
                 ..Default::default()
             };
-            let (text, fld) = (&mut self.text, &mut self.field);
+            let (text, fld, ai) = (&mut self.text, &mut self.field, self.auto_indent);
             let _ = self.ctx.run(raw, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.add(egui::TextEdit::singleline(fld).id(field()));
+                    if ai {
+                        apply_auto_indent(ctx, ed(), text);
+                    }
                     ui.add(egui::TextEdit::multiline(text).id(ed()));
                 });
             });
@@ -1500,6 +1748,10 @@ mod undo_tests {
             };
             self.frame(0.05, vec![ev]);
             self.frame(0.05, vec![]);
+        }
+        fn guarded(&mut self, g: &mut ImeGuard, dt: f64, mut events: Vec<egui::Event>) {
+            g.filter(self.t + dt, &mut events);
+            self.frame(dt, events);
         }
         fn type_text(&mut self, s: &str) {
             self.frame(0.05, vec![egui::Event::Text(s.into())]);
@@ -1547,5 +1799,267 @@ mod undo_tests {
         assert_eq!(h.text, "b a a");
         h.key(Key::Z, Modifiers::COMMAND);
         assert_eq!(h.text, "a a a");
+    }
+
+    /// IME: 変換 → 確定の Enter (同フレーム、Enter が先) は改行を入れない
+    #[test]
+    fn ime_confirm_enter_same_frame_no_newline() {
+        let mut h = Harness::new("");
+        let mut g = ImeGuard::default();
+        h.focus(ed());
+        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Enabled)]);
+        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Preedit("あ".into()))]);
+        h.guarded(
+            &mut g,
+            0.05,
+            vec![enter(), egui::Event::Ime(egui::ImeEvent::Commit("あ".into()))],
+        );
+        assert_eq!(h.text, "あ");
+    }
+
+    /// Commit の後に同フレームで Enter が来ても改行を入れない
+    #[test]
+    fn ime_confirm_enter_after_commit_same_frame() {
+        let mut h = Harness::new("");
+        let mut g = ImeGuard::default();
+        h.focus(ed());
+        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Enabled)]);
+        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Preedit("い".into()))]);
+        h.guarded(
+            &mut g,
+            0.05,
+            vec![egui::Event::Ime(egui::ImeEvent::Commit("い".into())), enter()],
+        );
+        assert_eq!(h.text, "い");
+    }
+
+    /// Enter が次のフレームに来ても (直後なら) 改行を入れない。変換中の Enter も同様
+    #[test]
+    fn ime_confirm_enter_next_frame_suppressed() {
+        let mut h = Harness::new("");
+        let mut g = ImeGuard::default();
+        h.focus(ed());
+        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Preedit("う".into()))]);
+        // 変換中に Enter だけのフレーム、その次に Commit
+        h.guarded(&mut g, 0.01, vec![enter()]);
+        h.guarded(&mut g, 0.01, vec![egui::Event::Ime(egui::ImeEvent::Commit("う".into()))]);
+        // Commit の直後のフレームに Enter
+        h.guarded(&mut g, 0.01, vec![enter()]);
+        assert_eq!(h.text, "う");
+    }
+
+    /// IME を使わない Enter は改行になり、確定から時間が経った Enter も改行になる
+    #[test]
+    fn plain_enter_inserts_newline() {
+        let mut h = Harness::new("");
+        let mut g = ImeGuard::default();
+        h.focus(ed());
+        h.guarded(&mut g, 0.05, vec![enter()]);
+        assert_eq!(h.text, "\n");
+        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Preedit("え".into()))]);
+        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Commit("え".into()))]);
+        h.guarded(&mut g, 0.5, vec![enter()]);
+        assert_eq!(h.text, "\nえ\n");
+    }
+
+    fn shift_enter() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::SHIFT,
+        }
+    }
+
+    /// 空白でインデントされた行の末尾で Enter: 同じ空白が次の行に入り、キャレットはその末尾
+    #[test]
+    fn auto_indent_spaces() {
+        let mut h = Harness::with_indent("    abc");
+        h.select(7, 7);
+        h.frame(0.05, vec![enter()]);
+        assert_eq!(h.text, "    abc\n    ");
+        assert_eq!(editor_sel(&h.ctx, ed()), Some((12, 12)));
+        // 続けて入力すると、インデントの後ろに入る
+        h.type_text("x");
+        assert_eq!(h.text, "    abc\n    x");
+    }
+
+    /// タブと空白の混在もそのまま写す
+    #[test]
+    fn auto_indent_tabs() {
+        let mut h = Harness::with_indent("\t \tfoo");
+        h.select(6, 6);
+        h.frame(0.05, vec![enter()]);
+        assert_eq!(h.text, "\t \tfoo\n\t \t");
+        assert_eq!(editor_sel(&h.ctx, ed()), Some((10, 10)));
+    }
+
+    /// インデントの無い行では普通の改行
+    #[test]
+    fn auto_indent_none() {
+        let mut h = Harness::with_indent("abc");
+        h.select(3, 3);
+        h.frame(0.05, vec![enter()]);
+        assert_eq!(h.text, "abc\n");
+        assert_eq!(editor_sel(&h.ctx, ed()), Some((4, 4)));
+    }
+
+    /// 2 行目以降でも、その行のインデントを使う
+    #[test]
+    fn auto_indent_uses_current_line() {
+        let mut h = Harness::with_indent("a\n  b\nc");
+        h.select(5, 5); // "  b" の末尾
+        h.frame(0.05, vec![enter()]);
+        assert_eq!(h.text, "a\n  b\n  \nc");
+        assert_eq!(editor_sel(&h.ctx, ed()), Some((8, 8)));
+    }
+
+    /// キャレットがインデントの途中にあるときは、キャレットより前の空白だけを写す
+    #[test]
+    fn auto_indent_caret_inside_indent() {
+        let mut h = Harness::with_indent("    abc");
+        h.select(2, 2);
+        h.frame(0.05, vec![enter()]);
+        assert_eq!(h.text, "  \n    abc");
+        assert_eq!(editor_sel(&h.ctx, ed()), Some((5, 5)));
+    }
+
+    /// 選択範囲は「改行 + インデント」に置き換わる
+    #[test]
+    fn auto_indent_replaces_selection() {
+        let mut h = Harness::with_indent("  abcdef");
+        h.select(4, 6); // "cd"
+        h.frame(0.05, vec![enter()]);
+        assert_eq!(h.text, "  ab\n  ef");
+        assert_eq!(editor_sel(&h.ctx, ed()), Some((7, 7)));
+    }
+
+    /// Shift+Enter も Enter と同じ
+    #[test]
+    fn auto_indent_shift_enter() {
+        let mut h = Harness::with_indent("  abc");
+        h.select(5, 5);
+        h.frame(0.05, vec![shift_enter()]);
+        assert_eq!(h.text, "  abc\n  ");
+    }
+
+    /// 自動インデントが無効なら普通の改行
+    #[test]
+    fn auto_indent_off_plain_newline() {
+        let mut h = Harness::new("    abc");
+        h.select(7, 7);
+        h.frame(0.05, vec![enter()]);
+        assert_eq!(h.text, "    abc\n");
+    }
+
+    /// Ctrl+Z 1 回で改行とインデントが一緒に戻り、Ctrl+Y でやり直せる
+    #[test]
+    fn auto_indent_undo_redo_one_step() {
+        let mut h = Harness::with_indent("    abc");
+        h.select(7, 7);
+        h.type_text("d"); // 直前の入力と履歴が混ざらないこと
+        h.frame(0.05, vec![enter()]);
+        h.frame(0.05, vec![]);
+        assert_eq!(h.text, "    abcd\n    ");
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert_eq!(h.text, "    abcd");
+        h.key(Key::Y, Modifiers::COMMAND);
+        assert_eq!(h.text, "    abcd\n    ");
+    }
+
+    /// IME の確定 Enter (ImeGuard が取り除く) は、インデントも含め何も挿入しない
+    #[test]
+    fn auto_indent_ime_confirm_enter_inserts_nothing() {
+        let mut h = Harness::with_indent("  ");
+        let mut g = ImeGuard::default();
+        h.select(2, 2);
+        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Preedit("あ".into()))]);
+        h.guarded(
+            &mut g,
+            0.05,
+            vec![enter(), egui::Event::Ime(egui::ImeEvent::Commit("あ".into()))],
+        );
+        h.guarded(&mut g, 0.01, vec![enter()]); // 確定直後の遅れた Enter
+        assert_eq!(h.text, "  あ");
+        // 時間が経てば通常の Enter としてインデント付きの改行になる
+        h.guarded(&mut g, 0.5, vec![enter()]);
+        assert_eq!(h.text, "  あ\n  ");
+    }
+
+    /// Ctrl+Enter ではインデント処理をしない (イベントを取り除かない)
+    #[test]
+    fn auto_indent_ignores_ctrl_enter() {
+        let mut h = Harness::with_indent("  a");
+        h.select(3, 3);
+        let ev = egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        h.frame(0.05, vec![ev]);
+        assert!(!h.text.ends_with("\n  "));
+    }
+
+    /// Shift+Enter など Enter 以外・修飾付きの扱いは変えない (変換中でなければ素通し)
+    #[test]
+    fn guard_passes_other_events() {
+        let mut g = ImeGuard::default();
+        let mut ev = vec![enter(), egui::Event::Text("a".into())];
+        g.filter(1.0, &mut ev);
+        assert_eq!(ev.len(), 2);
+    }
+
+    /// 変換中の範囲: Preedit で未確定文字列の範囲になり、Commit / 空 Preedit / Disabled で消える
+    #[test]
+    fn preedit_range_tracks_composition() {
+        let mut h = Harness::new("ab");
+        let mut g = ImeGuard::default();
+        h.focus(ed());
+        let base = editor_sel(&h.ctx, ed()).map_or(0, |s| s.1);
+        let range =
+            |h: &Harness, g: &ImeGuard| preedit_range(g.composing, editor_sel(&h.ctx, ed()));
+        let ime = |e: egui::ImeEvent| vec![egui::Event::Ime(e)];
+        assert_eq!(range(&h, &g), None, "変換前は範囲なし");
+        h.guarded(&mut g, 0.05, ime(egui::ImeEvent::Enabled));
+        h.guarded(&mut g, 0.05, ime(egui::ImeEvent::Preedit("か".into())));
+        assert_eq!(range(&h, &g), Some((base, base + 1)));
+        h.guarded(&mut g, 0.05, ime(egui::ImeEvent::Preedit("かん".into())));
+        assert_eq!(range(&h, &g), Some((base, base + 2)), "伸びても開始位置は同じ");
+        h.guarded(&mut g, 0.05, ime(egui::ImeEvent::Preedit(String::new())));
+        assert_eq!(range(&h, &g), None, "取り消し (空 Preedit)");
+        assert!(!h.text.contains('か'));
+        h.guarded(&mut g, 0.05, ime(egui::ImeEvent::Preedit("字".into())));
+        assert_eq!(range(&h, &g), Some((base, base + 1)));
+        h.guarded(&mut g, 0.05, ime(egui::ImeEvent::Commit("字".into())));
+        assert_eq!(range(&h, &g), None, "確定後は範囲なし");
+        assert!(h.text.contains('字'));
+        h.guarded(&mut g, 0.05, ime(egui::ImeEvent::Preedit("あ".into())));
+        h.guarded(&mut g, 0.05, ime(egui::ImeEvent::Disabled));
+        assert_eq!(range(&h, &g), None, "Disabled でも消える");
+    }
+
+    /// 改行をまたぐ未確定範囲が、行ごとの矩形に分割される
+    #[test]
+    fn preedit_rects_split_by_row() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {}); // フォントを初期化
+        let font = egui::FontId::monospace(14.0);
+        let galley = ctx.fonts(|f| {
+            f.layout(
+                "abcd\nefgh".into(),
+                font.clone(),
+                egui::Color32::WHITE,
+                f32::INFINITY,
+            )
+        });
+        assert_eq!(preedit_rects(&galley, (1, 3)).len(), 1);
+        let r = preedit_rects(&galley, (3, 7)); // "d" + 改行 + "ef"
+        assert_eq!(r.len(), 2);
+        assert!(r[0].min.y < r[1].min.y);
+        assert!(r[0].width() > 0.0 && r[1].width() > 0.0);
+        assert!(preedit_rects(&galley, (4, 5)).is_empty(), "改行だけは描かない");
     }
 }

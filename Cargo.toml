@@ -1,6 +1,6 @@
 [package]
 name = "rs_editor"
-version = "1.0.0"
+version = "1.0.1-dev2"
 edition = "2021"
 description = "Tabbed text editor with character encoding conversion"
 license = "MIT"

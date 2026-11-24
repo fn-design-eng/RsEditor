@@ -2658,7 +2658,7 @@ dependencies = [
 
 [[package]]
 name = "rs_editor"
-version = "1.0.0"
+version = "1.0.1-dev2"
 dependencies = [
  "chardetng",
  "eframe",
