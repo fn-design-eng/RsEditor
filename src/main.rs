@@ -606,14 +606,14 @@ fn mutates_text(e: &egui::Event) -> bool {
 /// 動かす入力 (矢印キー・マウスなど。`moves_caret`) があると、その結果が反映されていない状態で
 /// 求めてしまう。そのときは、その Enter と後ろのイベントをこのフレームの入力から外して返す。
 /// 呼び出し側は、それを次のフレームの入力の先頭へ戻す (`App::deferred_events`)。
+///
+/// 持ち越しの本命は `App::raw_input_hook` (`auto_indent_split`) で行う。ここでの持ち越しは、
+/// フレームの途中で条件が食い違ったとき (フォーカスを取った直後など) の安全網
 fn apply_auto_indent(ctx: &egui::Context, id: egui::Id, text: &str) -> Vec<egui::Event> {
     if !ctx.memory(|m| m.has_focus(id)) {
         return Vec::new();
     }
-    let is_enter = |e: &egui::Event| {
-        matches!(e, egui::Event::Key { key: Key::Enter, pressed: true, modifiers, .. }
-            if !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.mac_cmd)
-    };
+    let is_enter = is_auto_indent_enter;
     if !ctx.input(|i| i.events.iter().any(is_enter)) {
         return Vec::new();
     }
@@ -645,6 +645,38 @@ fn apply_auto_indent(ctx: &egui::Context, id: egui::Id, text: &str) -> Vec<egui:
             .map(|n| i.events.split_off(n))
             .unwrap_or_default()
     })
+}
+
+/// 自動インデントの対象になる Enter (Ctrl/Alt なしの押下) か
+fn is_auto_indent_enter(e: &egui::Event) -> bool {
+    matches!(e, egui::Event::Key { key: Key::Enter, pressed: true, modifiers, .. }
+        if !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.mac_cmd)
+}
+
+/// 自動インデントのために次のフレームへ持ち越す入力の位置を、入力の列 (フレームの最初の
+/// 状態) から求める。`None` なら持ち越さない。
+///
+/// 編集欄が処理する入力の順序を保つため、次のように切る:
+/// - Enter より前に本文を書き換える・キャレットを動かす入力があれば、その Enter と
+///   それ以降のすべて (Ctrl+S・Ctrl+Tab・Ctrl+W などのショートカットも含む)
+/// - Enter が先頭の (影響する入力が前に無い) ときは、その Enter の次以降のすべて
+///
+/// 後者が必要なのは、ショートカットがフレームの先頭で (編集欄が Enter を処理する前に)
+/// 消費されるため。同じフレームに残すと、保存・タブの切り替えが改行より先に行われてしまう。
+/// `dragging` はこのフレームの終わりにマウスのボタンが押されたままか
+fn auto_indent_split(events: &[egui::Event], dragging: bool) -> Option<usize> {
+    let mut mutated = false;
+    for (n, e) in events.iter().enumerate() {
+        if is_auto_indent_enter(e) {
+            if mutated {
+                return Some(n);
+            }
+            return (n + 1 < events.len()).then_some(n + 1);
+        } else if mutates_text(e) || moves_caret(e, dragging) {
+            mutated = true;
+        }
+    }
+    None
 }
 
 /// 一致箇所の背景を付けた LayoutJob 用のセクションを作る。全体を隙間なく覆うように並べる
@@ -1012,6 +1044,14 @@ enum Modal {
         ok: Confirmed,
         seen: Option<Fingerprint>,
     },
+    /// 保存した直後に、保存先が書いた内容と一致するか確かめられなかった (他のプログラムが
+    /// 直後に書き換えた可能性がある)。文書は変更ありのまま残している。`preserved` は、
+    /// 置き換えの直前に他のプログラムが書いていた版を退避した場所 (あれば)
+    Unverified {
+        id: u64,
+        path: PathBuf,
+        preserved: Option<PathBuf>,
+    },
     /// 未保存の編集を捨てて、指定した文字コードで読み直す
     ConfirmReload { id: u64, enc: Enc },
     /// 大きなファイルを開く確認
@@ -1248,6 +1288,9 @@ struct LoadOrigin {
     active_doc: Option<u64>,
     /// フォーカスのあった欄
     focus: Option<egui::Id>,
+    /// 選択していた文書の編集の世代 (`Doc::generation`)。読み込みの間に同じタブへ
+    /// 入力を続けていた (世代が進んだ) なら、新しいタブを選択して入力の行き先を奪わない
+    active_generation: Option<u64>,
 }
 
 /// バックグラウンドのスレッドで実行中の読み込み
@@ -1473,6 +1516,7 @@ impl App {
         let origin = LoadOrigin {
             active_doc: self.docs.get(self.active).map(|d| d.id),
             focus: self.ctx.memory(|m| m.focused()),
+            active_generation: self.docs.get(self.active).map(|d| d.generation),
         };
         self.loads.push(PendingLoad {
             path,
@@ -1512,6 +1556,11 @@ impl App {
     fn user_unchanged_since(&self, ctx: &egui::Context, o: &LoadOrigin) -> bool {
         let active = self.docs.get(self.active).map(|d| d.id);
         if active != o.active_doc {
+            return false;
+        }
+        // 読み込みの間に、選択中の文書を編集していた (打ち続けている) なら、フォーカスが
+        // 同じままでも、新しいタブへ切り替えない (以降の入力が新しいタブへ入ってしまう)
+        if self.docs.get(self.active).map(|d| d.generation) != o.active_generation {
             return false;
         }
         let focus = ctx.memory(|m| m.focused());
@@ -1654,7 +1703,8 @@ impl App {
         let d = &self.docs[idx];
         // 変更のない文書の上書き保存では何も書かない (デコードできなかったバイトや、
         // 混在していた改行コードを、意図せず書き換えてしまわないように)
-        if !save_as && d.path.is_some() && !d.dirty {
+        // (保存の直後に保存先を確かめられなかった文書は、変更がなくても確認つきで保存し直す)
+        if !save_as && d.path.is_some() && !d.dirty && !d.disk_unverified {
             self.status = format!("{} に変更はありません", d.title());
             return true;
         }
@@ -1882,20 +1932,35 @@ impl App {
         let d = &mut self.docs[idx];
         d.path = Some(path.clone());
         let mut note = String::new();
+        // 保存を「成功」として続き (タブを閉じる・終了) へ進めてよいか。
+        // 他のプログラムの版を退避したときは、利用者に知らせて止める
+        let mut finished = true;
+        // 保存先が書いた内容そのものだと確かめられなかったか
+        let mut unverified = false;
+        let mut preserved_at = None;
         match written {
             fileio::Written::Verified(fp) => {
                 d.fingerprint = Some(fp);
                 d.disk_unverified = false;
             }
-            fileio::Written::Unverified => {
-                // 他のプログラムが置き換えの直後に差し替えた可能性がある。その版の指紋を
-                // 「自分が書いたもの」として覚えると、次の保存で気づかずに上書きしてしまう
-                d.fingerprint = None;
-                d.disk_unverified = true;
-                note.push_str(
-                    " ※保存の直後にファイルが変わった可能性があります (次の保存の前に確認します)",
-                );
+            fileio::Written::Unverified => unverified = true,
+            fileio::Written::Preserved { backup, fp } => {
+                finished = false;
+                unverified = fp.is_none();
+                if let Some(fp) = fp {
+                    d.fingerprint = Some(fp);
+                    d.disk_unverified = false;
+                }
+                preserved_at = Some(backup);
             }
+        }
+        if unverified {
+            // 他のプログラムが置き換えの直後に差し替えた可能性がある。その版の指紋を
+            // 「自分が書いたもの」として覚えると、次の保存で気づかずに上書きしてしまう。
+            // 編集中の内容はディスクに無いかもしれないので、保存済みにはしない
+            d.fingerprint = None;
+            d.disk_unverified = true;
+            finished = false;
         }
         d.lossy_load = false;
         d.mixed_eol = false;
@@ -1907,6 +1972,20 @@ impl App {
             note.push_str(" ※一部の文字は保存形式に合わせて変わりました (Ctrl+Z で戻せます)");
         }
         d.meta_changed();
+        if unverified {
+            // 保存済みにしない (変更ありのまま)。タブを閉じる・終了する操作で内容を失わないようにする
+            d.dirty = true;
+            self.status = format!(
+                "{} を保存しましたが、保存先が書いた内容と一致するか確認できませんでした",
+                d.title()
+            );
+            self.modals.push_back(Modal::Unverified {
+                id,
+                path: path.clone(),
+                preserved: preserved_at,
+            });
+            return false;
+        }
         d.mark_saved();
         self.status = format!(
             "{} を保存しました ({} / {}){}",
@@ -1915,7 +1994,17 @@ impl App {
             d.eol.label(),
             note
         );
-        true
+        if let Some(backup) = preserved_at {
+            self.modals.push_back(Modal::Info(format!(
+                "保存の直前に、他のプログラムがこのファイルを書き換えていました:\n{}\n\n\
+                 その版 (書き換えられた内容) は消さずに、次のファイルに残しました:\n{}\n\n\
+                 保存先には、いま編集していた内容を書き込みました。\n\
+                 (タブを閉じる・終了する操作は中止しました)",
+                path.display(),
+                backup.display()
+            )));
+        }
+        finished
     }
 
     fn request_close(&mut self, idx: usize) {
@@ -2680,7 +2769,12 @@ impl App {
         if auto_indent && !composing {
             let deferred = apply_auto_indent(ui.ctx(), id, &d.text);
             if !deferred.is_empty() {
-                // 本文を書き換える入力の後ろの Enter は、次のフレームで (更新後の本文で) 処理する
+                // 本文を書き換える入力の後ろの Enter は、次のフレームで (更新後の本文で) 処理する。
+                // (`raw_input_hook` がすでに持ち越していれば、その前に処理する分として前へ足す)
+                let mut deferred = deferred;
+                if let Some((_, later)) = self.deferred_events.take() {
+                    deferred.extend(later);
+                }
                 self.deferred_events = Some((d.id, deferred));
                 ui.ctx().request_repaint();
             }
@@ -2940,6 +3034,28 @@ impl eframe::App for App {
                 && ctx.memory(|m| m.has_focus(editor_id(doc_id)));
             if still_target {
                 raw_input.events.splice(0..0, deferred);
+            }
+        }
+        // 自動インデントの Enter と、それ以降の入力を次のフレームへ持ち越すかを、ここで
+        // (update の中のショートカットの処理より前に) 決める。ショートカットの Ctrl+S などが
+        // 改行より先に処理されて、保存やタブの切り替えが入力の順序と食い違うのを防ぐ
+        if self.auto_indent && !self.ime_guard.composing {
+            if let Some(d) = self.docs.get(self.active) {
+                let id = editor_id(d.id);
+                let focused = self.focus_editor || ctx.memory(|m| m.has_focus(id));
+                if focused && TextEditState::load(ctx, id).is_some() {
+                    let mut down = ctx.input(|i| i.pointer.any_down());
+                    for e in &raw_input.events {
+                        if let egui::Event::PointerButton { pressed, .. } = e {
+                            down = *pressed;
+                        }
+                    }
+                    if let Some(n) = auto_indent_split(&raw_input.events, down) {
+                        let rest = raw_input.events.split_off(n);
+                        self.deferred_events = Some((d.id, rest));
+                        ctx.request_repaint();
+                    }
+                }
             }
         }
     }
@@ -3232,6 +3348,37 @@ impl App {
                             });
                         }
                         if ui.button("キャンセル").clicked() {
+                            acts.push(Action::DismissModal);
+                        }
+                    });
+                });
+            }
+            Modal::Unverified {
+                id,
+                path,
+                preserved,
+            } => {
+                win("保存先を確認できませんでした").show(ctx, |ui| {
+                    ui.label(format!(
+                        "保存した直後に、このファイルが他のプログラム (同期ツールなど) に\n\
+                         変更された可能性があります:\n{}\n\n\
+                         編集中の内容はディスクに無いかもしれないので、タブは保存済みにせず、\n\
+                         閉じる・終了する操作は中止しました。",
+                        path.display()
+                    ));
+                    if let Some(p) = &preserved {
+                        ui.add_space(4.0);
+                        ui.label(format!(
+                            "また、置き換えの直前に他のプログラムが書いていた版は、次のファイルに残しました:\n{}",
+                            p.display()
+                        ));
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("名前を付けて保存").clicked() {
+                            acts.push(Action::SaveAsFor(id, Then::None));
+                        }
+                        if ui.button("閉じる (タブはそのまま)").clicked() {
                             acts.push(Action::DismissModal);
                         }
                     });
@@ -5070,7 +5217,9 @@ mod app_tests {
         assert_eq!(app.docs[app.active].title(), "c.txt");
     }
 
-    /// 読み込みが終わるのと同じフレームのキー入力は、元のタブへ届く (取り込みは編集欄の後)
+    /// 読み込みが終わるのと同じフレームのキー入力は、元のタブへ届く (取り込みは編集欄の後)。
+    /// そのフレームで元のタブを編集した (打ち続けている) ので、新しいタブは選択せず、
+    /// 背景で開く (以降の入力が新しいタブへ入らない)
     #[test]
     fn completion_in_same_frame_does_not_retarget_input() {
         let t = Tmp::new();
@@ -5106,7 +5255,8 @@ mod app_tests {
             .expect("b も取り込まれている");
         assert!(app.docs[a_idx].text.contains('x'), "入力は元のタブへ: {:?}", app.docs[a_idx].text);
         assert_eq!(app.docs[b_idx].text, "bbb", "新しいタブには入らない");
-        assert_eq!(app.active, b_idx, "取り込みの後で、新しいタブを選択する");
+        assert_eq!(app.active, a_idx, "打っている最中なので、新しいタブは選択しない");
+        assert!(app.status.contains("「b.txt」を開きました"), "{}", app.status);
     }
 
     // ---- 確認の待ち行列 (項目 8)
@@ -5557,6 +5707,85 @@ mod app_tests {
         assert_eq!(app.docs[0].fingerprint, fileio::fingerprint(&p));
     }
 
+    /// 実際の保存で、置き換えの直後に保存先が差し替わった (`Written::Unverified`) とき:
+    /// 保存済みにせず (変更ありのまま)、タブを閉じる・終了する操作を止めて、確認の画面を出す。
+    /// 変更がなくても、次の保存は (「変更はありません」で終わらず) 確認に進む
+    #[test]
+    fn unverified_save_keeps_tab_dirty_and_stops_close_and_exit() {
+        let t = Tmp::new();
+        let p = t.file("f.txt", b"one");
+        let mut app = app();
+        open(&mut app, &p);
+        let ctx = app.ctx.clone();
+        let id = app.docs[0].id;
+        edit(&mut app, 0, |s| s.push_str("-mine"));
+        fileio::test_hooks::after_replace(|t| std::fs::write(t, b"synced elsewhere").unwrap());
+        app.run(&ctx, Action::SaveAndClose(id));
+        assert_eq!(std::fs::read(&p).unwrap(), b"synced elsewhere");
+        assert!(matches!(app.modal(), Some(Modal::Unverified { preserved: None, .. })));
+        assert_eq!(app.docs.len(), 1);
+        assert_eq!(app.docs[0].id, id, "保存して閉じる、は閉じない");
+        assert!(app.docs[0].dirty, "保存済みにしない");
+        assert!(app.docs[0].disk_unverified);
+        assert_eq!(app.docs[0].text, "one-mine", "編集内容は残っている");
+        // 確認の画面を閉じた後、変更がなくても次の保存は確認に進む
+        app.run(&ctx, Action::DismissModal);
+        app.run(&ctx, Action::Save);
+        assert!(matches!(app.modal(), Some(Modal::Conflict { .. })));
+        assert!(!app.status.contains("変更はありません"));
+        assert_eq!(std::fs::read(&p).unwrap(), b"synced elsewhere");
+        app.run(&ctx, Action::DismissModal);
+        // すべて保存して終了、も止まる
+        fileio::test_hooks::after_replace(|t| std::fs::write(t, b"synced again").unwrap());
+        app.docs[0].disk_unverified = false;
+        app.docs[0].fingerprint = fileio::fingerprint(&p);
+        app.run(&ctx, Action::SaveAllAndExit);
+        assert!(!app.allow_exit, "終了しない");
+        assert!(matches!(app.modal(), Some(Modal::Unverified { .. })));
+        assert!(app.docs[0].dirty);
+    }
+
+    /// 最後の確認と置き換えの間に他のプログラムが書いた版は、消さずに見つけやすい名前で残し、
+    /// 知らせて、閉じる・終了する操作を止める。何も無ければ控えは残らない
+    #[test]
+    fn version_written_before_replace_is_preserved_and_reported() {
+        let t = Tmp::new();
+        let p = t.file("f.txt", b"one");
+        let mut app = app();
+        open(&mut app, &p);
+        let ctx = app.ctx.clone();
+        let id = app.docs[0].id;
+        edit(&mut app, 0, |s| s.push_str("-mine"));
+        fileio::test_hooks::before_replace(|t| std::fs::write(t, b"external version").unwrap());
+        app.run(&ctx, Action::SaveAndClose(id));
+        assert_eq!(std::fs::read(&p).unwrap(), b"one-mine");
+        assert_eq!(app.docs.len(), 1, "閉じない");
+        let Some(Modal::Info(msg)) = app.modal() else {
+            panic!("退避を知らせる画面のはず");
+        };
+        let kept: Vec<_> = std::fs::read_dir(&t.0)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|f| {
+                f.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("f (RsEditor 退避 ")
+            })
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read(&kept[0]).unwrap(), b"external version");
+        assert!(msg.contains(&kept[0].display().to_string()), "{msg}");
+        assert!(!app.docs[0].dirty, "保存先には書けている");
+        // 何も起きなければ、控えを残さずに普通に閉じる
+        app.run(&ctx, Action::DismissModal);
+        edit(&mut app, 0, |s| s.push('!'));
+        let n = std::fs::read_dir(&t.0).unwrap().count();
+        app.run(&ctx, Action::SaveAndClose(id));
+        assert_eq!(std::fs::read_dir(&t.0).unwrap().count(), n, "控えは残らない");
+        assert!(app.docs.iter().all(|d| d.id != id));
+    }
+
     /// 読み込みが終わるのと同じフレームの Ctrl+S / すべて置換は、元のタブに対して行われる
     #[test]
     fn actions_in_completion_frame_target_original_tab() {
@@ -5635,6 +5864,133 @@ mod app_tests {
         assert!(app.deferred_events.is_none());
         assert_eq!(app.docs[bi].text, "bbb");
         assert_eq!(app.docs[ai].text, "  ab\n  ");
+    }
+
+    fn ctrl_key(key: Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: if key == Key::Tab { Modifiers::CTRL } else { Modifiers::COMMAND },
+        }
+    }
+
+    /// 編集欄にフォーカスがあり、キャレットが末尾にある状態の (インデント 2 つの 1 行) アプリ
+    fn indented_app(t: &Tmp, name: &str) -> (egui::Context, App, f64, PathBuf) {
+        let p = t.file(name, b"  a");
+        let ctx = egui::Context::default();
+        let mut app = App::blank(ctx.clone());
+        let mut clock = 0.0;
+        app.open_path(p.clone());
+        wait_loads(&mut app);
+        for _ in 0..3 {
+            frame(&ctx, &mut app, &mut clock, vec![], false);
+        }
+        set_editor_sel(&ctx, editor_id(app.docs[0].id), 3, 3);
+        frame(&ctx, &mut app, &mut clock, vec![], false);
+        (ctx, app, clock, p)
+    }
+
+    /// 文字入力 → Enter → Ctrl+S が同じフレームに届いても、保存は改行より後 (入力の順序どおり)
+    #[test]
+    fn text_enter_save_in_one_frame_saves_the_newline() {
+        let t = Tmp::new();
+        let (ctx, mut app, mut clock, p) = indented_app(&t, "a.txt");
+        frame_hooked(
+            &ctx,
+            &mut app,
+            &mut clock,
+            vec![egui::Event::Text("b".into()), enter_ev(), ctrl_key(Key::S)],
+        );
+        for _ in 0..4 {
+            frame_hooked(&ctx, &mut app, &mut clock, vec![]);
+        }
+        assert_eq!(app.docs[0].text, "  ab\n  ");
+        assert_eq!(std::fs::read(&p).unwrap(), b"  ab\r\n  ", "改行とインデントも保存される");
+        assert!(!app.docs[0].dirty);
+        // Enter が先頭でも、後ろのショートカットは Enter の処理より後
+        let q = t.file("c.txt", b"  c");
+        open(&mut app, &q);
+        for _ in 0..3 {
+            frame_hooked(&ctx, &mut app, &mut clock, vec![]);
+        }
+        let ci = app.active;
+        set_editor_sel(&ctx, editor_id(app.docs[ci].id), 3, 3);
+        frame_hooked(&ctx, &mut app, &mut clock, vec![]);
+        frame_hooked(&ctx, &mut app, &mut clock, vec![enter_ev(), ctrl_key(Key::S)]);
+        for _ in 0..4 {
+            frame_hooked(&ctx, &mut app, &mut clock, vec![]);
+        }
+        assert_eq!(std::fs::read(&q).unwrap(), b"  c\r\n  ");
+    }
+
+    /// 文字入力 → Enter → Ctrl+Tab: 改行は元のタブへ入り、タブの切り替えはその後
+    #[test]
+    fn text_enter_ctrl_tab_in_one_frame_keeps_text_in_original_tab() {
+        let t = Tmp::new();
+        let (ctx, mut app, mut clock, _p) = indented_app(&t, "a.txt");
+        let b = t.file("b.txt", b"bbb");
+        open(&mut app, &b);
+        app.active = 0;
+        app.focus_editor = true;
+        for _ in 0..3 {
+            frame_hooked(&ctx, &mut app, &mut clock, vec![]);
+        }
+        let a_id = app.docs[0].id;
+        set_editor_sel(&ctx, editor_id(a_id), 3, 3);
+        frame_hooked(&ctx, &mut app, &mut clock, vec![]);
+        frame_hooked(
+            &ctx,
+            &mut app,
+            &mut clock,
+            vec![
+                egui::Event::Text("b".into()),
+                enter_ev(),
+                egui::Event::Text("Z".into()),
+                ctrl_key(Key::Tab),
+            ],
+        );
+        for _ in 0..5 {
+            frame_hooked(&ctx, &mut app, &mut clock, vec![]);
+        }
+        assert_eq!(app.docs[0].text, "  ab\n  Z", "元のタブに改行と、その後の文字が入る");
+        assert_eq!(app.active, 1, "切り替えは入力の後");
+        assert_eq!(app.docs[1].text, "bbb");
+    }
+
+    /// `auto_indent_split` の切り方: Enter が先頭ならその次から、後ろにあれば Enter から
+    #[test]
+    fn auto_indent_split_points() {
+        let s = ctrl_key(Key::S);
+        let txt = || egui::Event::Text("x".into());
+        assert_eq!(auto_indent_split(&[enter_ev()], false), None);
+        assert_eq!(auto_indent_split(&[enter_ev(), s.clone()], false), Some(1));
+        assert_eq!(auto_indent_split(&[txt(), enter_ev(), s.clone()], false), Some(1));
+        assert_eq!(auto_indent_split(&[txt(), s], false), None);
+    }
+
+    /// 読み込みの間に同じタブへ入力を続けていたら、読み込みが終わっても新しいタブを
+    /// 選択しない (以降の入力が新しいタブへ入らない)。背景で開く
+    #[test]
+    fn load_completion_does_not_steal_typing_focus() {
+        let t = Tmp::new();
+        let a = t.file("a.txt", b"abc");
+        let b = t.file("b.txt", b"bbb");
+        let mut app = app();
+        open(&mut app, &a);
+        let a_id = app.docs[0].id;
+        app.open_path(b);
+        // 読み込みの間に、同じタブへ打ち続ける
+        edit(&mut app, 0, |s| s.push('x'));
+        wait_loads(&mut app);
+        assert_eq!(app.docs.len(), 2, "B は開く");
+        assert_eq!(app.docs[app.active].id, a_id, "選択は A のまま");
+        assert!(app.status.contains("「b.txt」を開きました"), "{}", app.status);
+        // 打っていなければ、従来どおり新しいタブを選択する
+        let c = t.file("c.txt", b"ccc");
+        open(&mut app, &c);
+        assert_eq!(app.docs[app.active].title(), "c.txt");
     }
 
     fn enter_ev() -> egui::Event {

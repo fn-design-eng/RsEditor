@@ -415,13 +415,18 @@ fn create_temp(temp: &Path, private: bool) -> io::Result<std::fs::File> {
     o.open(temp)
 }
 
+/// 置き換えの結果。`Some(path)` は、置き換えで退避した「元の保存先」を、承知した状態とは
+/// 違う内容のまま残した場所 (消さずに、利用者が見つけられる名前で残してある)
+type Preserved = Option<PathBuf>;
+
 #[cfg(windows)]
 fn replace_file(
     target: &Path,
     temp: &Path,
     backup: &Path,
     target_exists: bool,
-) -> Result<(), WriteError> {
+    expect: &Expect,
+) -> Result<Preserved, WriteError> {
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH,
     };
@@ -446,8 +451,17 @@ fn replace_file(
             ) != 0
         };
         if ok {
-            let _ = std::fs::remove_file(backup); // 元の内容の控えはもう要らない
-            Ok(())
+            #[cfg(test)]
+            test_hooks::run_after_replace(target);
+            // 控え (b) は、置き換えられた (元の) ファイルそのもの。最後の確認から置き換えまでの
+            // 間に他のプログラムが新しい版を書いていたら、それがここへ移っている。
+            // 承知した状態と指紋が一致するときだけ捨てる。違う・確かめられないときは消さずに残す
+            if backup_matches(backup, expect) {
+                let _ = std::fs::remove_file(backup); // 元の内容の控えはもう要らない
+                Ok(None)
+            } else {
+                Ok(Some(preserve_backup(target, backup)))
+            }
         } else {
             Err(recover_failed_replace(
                 target,
@@ -462,7 +476,9 @@ fn replace_file(
         // SAFETY: s / t は NUL 終端の UTF-16 文字列で、呼び出しの間は生きている。
         let ok = unsafe { MoveFileExW(s.as_ptr(), t.as_ptr(), MOVEFILE_WRITE_THROUGH) != 0 };
         if ok {
-            return Ok(());
+            #[cfg(test)]
+            test_hooks::run_after_replace(target);
+            return Ok(None);
         }
         let err = io::Error::last_os_error();
         remove_own_temp(temp);
@@ -479,10 +495,15 @@ fn replace_file(
     temp: &Path,
     backup: &Path,
     target_exists: bool,
-) -> Result<(), WriteError> {
+    _expect: &Expect,
+) -> Result<Preserved, WriteError> {
     if target_exists {
         match std::fs::rename(temp, target) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                #[cfg(test)]
+                test_hooks::run_after_replace(target);
+                Ok(None)
+            }
             Err(e) => Err(recover_failed_replace(target, temp, backup, &e)),
         }
     } else {
@@ -490,9 +511,127 @@ fn replace_file(
         let r = std::fs::hard_link(temp, target);
         remove_own_temp(temp);
         match r {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                #[cfg(test)]
+                test_hooks::run_after_replace(target);
+                Ok(None)
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(WriteError::Conflict),
             Err(e) => Err(failed(e)),
+        }
+    }
+}
+
+
+/// 置き換えで退避した元のファイル (控え) が、承知した状態と同じか。
+/// 指紋を取れない (確かめられない) ときは、同じとは扱わない
+#[cfg_attr(not(windows), allow(dead_code))]
+fn backup_matches(backup: &Path, expect: &Expect) -> bool {
+    match expect {
+        #[cfg(test)]
+        Expect::Any => true,
+        Expect::Is(fp) => fp.is_some() && fingerprint(backup) == *fp,
+    }
+}
+
+/// 退避名に入れる現在時刻 (`yyyyMMdd-HHmmss`、ローカル時刻)
+#[cfg(windows)]
+fn local_timestamp() -> String {
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+    // SAFETY: 書き込み先の構造体 (ゼロ初期化) を渡すだけ。
+    let t = unsafe {
+        let mut t = std::mem::zeroed();
+        GetLocalTime(&mut t);
+        t
+    };
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
+    )
+}
+
+#[cfg(not(windows))]
+fn local_timestamp() -> String {
+    let s = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    format!("{s}")
+}
+
+/// ファイル名の長さの上限 (255) に収まるか (Windows は UTF-16 の単位数、それ以外はバイト数)
+fn name_fits(name: &str) -> bool {
+    if cfg!(windows) {
+        name.encode_utf16().count() <= 255
+    } else {
+        name.len() <= 255
+    }
+}
+
+/// 退避したファイルの、見つけやすい名前: `<元の名前> (RsEditor 退避 yyyyMMdd-HHmmss).<拡張子>`。
+/// 255 文字の上限を超えるときは、元の名前の部分を切り詰める
+fn preserved_name(target: &Path, stamp: &str, serial: u32) -> String {
+    let mut stem = target
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = target
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let more = if serial > 0 { format!(" {serial}") } else { String::new() };
+    let tail = format!(" (RsEditor 退避 {stamp}{more}){ext}");
+    loop {
+        let name = format!("{stem}{tail}");
+        if name_fits(&name) || stem.is_empty() {
+            return name;
+        }
+        stem.pop();
+    }
+}
+
+/// 置き換えで退避した控えを、利用者が見つけられる名前 (隠しでない、保存先の隣) に改めて残す。
+/// 名前を変えられなければ、控えの名前のまま残す。残した場所を返す
+fn preserve_backup(target: &Path, backup: &Path) -> PathBuf {
+    let stamp = local_timestamp();
+    for serial in 0..100 {
+        let to = target.with_file_name(preserved_name(target, &stamp, serial));
+        if exists_at(&to) {
+            continue;
+        }
+        return match std::fs::rename(backup, &to) {
+            Ok(()) => to,
+            Err(_) => backup.to_path_buf(),
+        };
+    }
+    backup.to_path_buf()
+}
+
+/// テスト用の差し込み口: 置き換えの直前・直後に、他のプログラムの書き込みを再現する
+#[cfg(test)]
+pub mod test_hooks {
+    use std::cell::RefCell;
+    use std::path::Path;
+    type Hook = Box<dyn FnOnce(&Path)>;
+    thread_local! {
+        static BEFORE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static AFTER: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+    /// 最後の確認の後、置き換えの直前に 1 回だけ呼ぶ
+    pub fn before_replace(f: impl FnOnce(&Path) + 'static) {
+        BEFORE.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+    /// 置き換えの直後 (保存先の指紋を取る前) に 1 回だけ呼ぶ
+    pub fn after_replace(f: impl FnOnce(&Path) + 'static) {
+        AFTER.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+    pub(super) fn run_before_replace(target: &Path) {
+        if let Some(f) = BEFORE.with(|h| h.borrow_mut().take()) {
+            f(target);
+        }
+    }
+    pub(super) fn run_after_replace(target: &Path) {
+        if let Some(f) = AFTER.with(|h| h.borrow_mut().take()) {
+            f(target);
         }
     }
 }
@@ -523,6 +662,13 @@ pub enum Written {
     /// 置き換えの直後に別の版へ差し替えた可能性がある) か、確かめられなかった。
     /// 保存先の指紋は「不明」として扱い、次の保存の前に確認する
     Unverified,
+    /// 置き換えの直前に他のプログラムが新しい版を書いていた (退避した元のファイルが、承知した
+    /// 状態と一致しなかった)。その版は消さずに `backup` へ残してある。保存先は、書いた内容。
+    /// `fp` は、書いた内容と保存先が一致したことを確かめられたときの保存先の指紋
+    Preserved {
+        backup: PathBuf,
+        fp: Option<Fingerprint>,
+    },
 }
 
 /// `atomic_write` の本体。一時ファイル・控えの名前を指定する。
@@ -567,10 +713,17 @@ fn atomic_write_at(
         #[cfg(test)]
         Expect::Any => {}
     }
-    replace_file(path, temp, backup, existing.is_some())?;
-    Ok(match (wrote, fingerprint(path)) {
-        (Some(w), Some(now)) if w == now => Written::Verified(now),
-        _ => Written::Unverified,
+    #[cfg(test)]
+    test_hooks::run_before_replace(path);
+    let preserved = replace_file(path, temp, backup, existing.is_some(), expect)?;
+    let state = match (wrote, fingerprint(path)) {
+        (Some(w), Some(now)) if w == now => Some(now),
+        _ => None,
+    };
+    Ok(match (preserved, state) {
+        (Some(backup), fp) => Written::Preserved { backup, fp },
+        (None, Some(now)) => Written::Verified(now),
+        (None, None) => Written::Unverified,
     })
 }
 
@@ -800,7 +953,7 @@ mod tests {
         // replace_file を直接呼んで「確認の後に作られた」状況を再現する
         std::fs::write(&temp, b"mine").unwrap();
         std::fs::write(&p, b"theirs").unwrap();
-        let r = replace_file(&p, &temp, &backup, false);
+        let r = replace_file(&p, &temp, &backup, false, &Expect::Any);
         assert_eq!(r, Err(WriteError::Conflict));
         assert_eq!(std::fs::read(&p).unwrap(), b"theirs");
         assert!(!temp.exists(), "自分の一時ファイルは片付ける");
@@ -984,6 +1137,64 @@ mod tests {
         let mine = fingerprint(&p).unwrap();
         std::fs::write(&p, b"someone else's version").unwrap();
         assert_ne!(fingerprint(&p).unwrap(), mine);
+    }
+
+    /// 置き換えの直後に保存先が別の版へ差し替わったら、`Unverified` になる (保存済みとは扱わない)
+    #[test]
+    fn replaced_target_swapped_right_after_is_unverified() {
+        let d = TempDir::new();
+        let p = d.file("a.txt");
+        std::fs::write(&p, b"original").unwrap();
+        let seen = fingerprint(&p);
+        test_hooks::after_replace(|t| std::fs::write(t, b"synced by someone else").unwrap());
+        let w = atomic_write(&p, b"mine", &Expect::Is(seen)).unwrap();
+        assert_eq!(w, Written::Unverified);
+        assert!(d.leftovers().is_empty(), "{:?}", d.leftovers());
+    }
+
+    /// 最後の確認と置き換えの間に他のプログラムが書いた版は、控えと一緒に消さず、
+    /// 見つけやすい名前で残す
+    #[test]
+    fn version_written_between_check_and_replace_is_preserved() {
+        let d = TempDir::new();
+        let p = d.file("a.txt");
+        std::fs::write(&p, b"original").unwrap();
+        let seen = fingerprint(&p);
+        test_hooks::before_replace(|t| std::fs::write(t, b"external version").unwrap());
+        let w = atomic_write(&p, b"mine", &Expect::Is(seen)).unwrap();
+        let Written::Preserved { backup, fp } = w else {
+            panic!("退避されるはず: {w:?}");
+        };
+        assert_eq!(std::fs::read(&p).unwrap(), b"mine");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"external version");
+        assert_eq!(backup.parent(), p.parent());
+        let name = backup.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("a (RsEditor 退避 ") && name.ends_with(").txt"), "{name}");
+        assert!(!name.starts_with('.'), "隠しファイルにしない: {name}");
+        assert_eq!(fp, fingerprint(&p), "保存先は書いた内容");
+        assert!(d.leftovers().is_empty(), "{:?}", d.leftovers());
+        // 2 回目 (同じ秒でも別の名前になる)
+        let seen = fingerprint(&p);
+        test_hooks::before_replace(|t| std::fs::write(t, b"external 2").unwrap());
+        let Written::Preserved { backup: b2, .. } =
+            atomic_write(&p, b"mine 2", &Expect::Is(seen)).unwrap()
+        else {
+            panic!()
+        };
+        assert_ne!(b2, backup);
+        assert_eq!(std::fs::read(&backup).unwrap(), b"external version");
+        assert_eq!(std::fs::read(&b2).unwrap(), b"external 2");
+    }
+
+    /// 退避の名前は 255 文字に収まる (元の名前を切り詰める)
+    #[test]
+    fn preserved_name_stays_within_limit() {
+        let long = format!("{}.txt", "あ".repeat(240));
+        let n = preserved_name(Path::new(&long), "20260101-000000", 0);
+        assert!(name_fits(&n), "{}", n.encode_utf16().count());
+        assert!(n.ends_with(" (RsEditor 退避 20260101-000000).txt"));
+        let short = preserved_name(Path::new("memo.md"), "20260101-000000", 2);
+        assert_eq!(short, "memo (RsEditor 退避 20260101-000000 2).md");
     }
 
     /// 255 文字に近い長いファイル名でも保存できる (一時ファイル・控えの名前は元の名前に依存しない)

@@ -1,6 +1,6 @@
 [package]
 name = "rs_editor"
-version = "1.0.1-dev11"
+version = "1.0.1-dev12"
 edition = "2021"
 description = "Tabbed text editor with character encoding conversion"
 license = "MIT"
@@ -33,6 +33,7 @@ features = [
     "Win32_Globalization",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Input_Ime",
 ]
