@@ -21,6 +21,7 @@ Rust (eframe/egui) 製のタブ付きテキストエディタ。文字コード�
 - **ユーザーから明示的な指示があるまで、次の操作は行わない:**
   - 上記の開発版コミット以外の `git commit`
   - 正式版のリリース（タグ付け、GitHub Release の作成、push を含む）
+- **公開済みの正式版は差し替えない。** 公開後に見つかった不具合は、次のパッチ版（例: v1.0.1 の後は v1.0.2-dev1 → v1.0.2）として出す。公開済みのタグの付け替えや、GitHub Release のアセットの上書きはしない。
 - 実行ファイル `RsEditor.exe` と `dist/` はリポジトリに含めない（`.gitignore` 済み）。
 - リリース時は `pwsh tools\package.ps1` で配布アーカイブを作り、GitHub Release に添付する。
   - 添付するのは `dist\RsEditor-v<version>-windows-x64.zip` と `.7z` の 2 つ（中身は同じ）。
