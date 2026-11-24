@@ -1,6 +1,6 @@
 [package]
 name = "rs_editor"
-version = "1.0.1-dev8"
+version = "1.0.1-dev9"
 edition = "2021"
 description = "Tabbed text editor with character encoding conversion"
 license = "MIT"
@@ -25,7 +25,12 @@ panic = "abort"
 winresource = "0.1"
 
 
-# IME の文節 (IMM32) の取得に使う
+# IME の文節 (IMM32) の取得と、保存時のファイル置き換え (ReplaceFileW) に使う
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.52"
-features = ["Win32_Foundation", "Win32_Globalization", "Win32_UI_Input_Ime"]
+features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Input_Ime",
+]

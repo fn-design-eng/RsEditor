@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod encoding;
+mod fileio;
 mod ime;
 mod search;
 
@@ -10,7 +11,10 @@ use egui::text::{CCursor, CCursorRange};
 use egui::widgets::text_edit::TextEditState;
 use egui::{Key, KeyboardShortcut, Modifiers, ViewportCommand};
 use encoding::{Enc, Eol};
+use fileio::Fingerprint;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::sync::Arc;
 
 const APP_NAME: &str = "RsEditor";
 /// Cargo.toml の version (例: "1.0.0")
@@ -35,34 +39,178 @@ fn match_colors(dark: bool) -> (egui::Color32, egui::Color32) {
     }
 }
 
+/// これより大きい文書は、保存内容との完全な比較 (ハッシュ) をしない (入力のたびに全文を走査して
+/// 重くならないように)。その場合は、編集したら変更あり (dirty) のままにする
+const EXACT_DIRTY_LIMIT: usize = 20 * 1024 * 1024;
+
+/// 保存 (または読み込み) した時点の内容の要約。元の内容に戻したとき (Undo など) に
+/// 「変更あり」を解除するために使う
+#[derive(Clone, PartialEq)]
+struct Snapshot {
+    len: usize,
+    hash: u64,
+    enc: Enc,
+    eol: Eol,
+    /// ハッシュを取ったか (大きな文書では取らない)
+    exact: bool,
+}
+
+fn hash_text(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+impl Snapshot {
+    fn of(text: &str, enc: Enc, eol: Eol) -> Self {
+        let exact = text.len() <= EXACT_DIRTY_LIMIT;
+        Snapshot {
+            len: text.len(),
+            hash: if exact { hash_text(text) } else { 0 },
+            enc,
+            eol,
+            exact,
+        }
+    }
+}
+
+/// 文書の版ごとに数え直す値のキャッシュ
+struct DocStats {
+    rev: u64,
+    chars: usize,
+    lines: usize,
+}
+
+/// 編集欄の表示 (galley) のキャッシュ。毎フレームの再レイアウト (全文のコピーとハッシュ) を避ける
+struct LayoutCache {
+    key: LayoutKey,
+    galley: Arc<egui::Galley>,
+}
+
+/// レイアウト結果が変わる条件のすべて。これが同じなら、前のフレームの galley を使い回せる
+#[derive(Clone, PartialEq)]
+struct LayoutKey {
+    rev: u64,
+    /// 折り返さないときは 0
+    wrap_width: u32,
+    font_size: u32,
+    text_color: egui::Color32,
+    dark: bool,
+    pixels_per_point: u32,
+    /// 検索結果の強調 (検索結果キャッシュの識別子。強調なしは 0)
+    find_stamp: u64,
+    /// 「現在の一致」として濃く表示する一致の番号
+    exact: Option<usize>,
+}
+
+/// galley の各表示行が属する論理行の番号 (1 始まり)。行番号を、見えている行からだけ描くために使う
+struct RowLines {
+    galley: Arc<egui::Galley>,
+    lines: Vec<u32>,
+}
+
+/// 各表示行の論理行番号。`ends_with_newline` は各表示行が改行で終わるか
+fn row_line_numbers(ends_with_newline: impl Iterator<Item = bool>) -> Vec<u32> {
+    let mut line = 1u32;
+    ends_with_newline
+        .map(|nl| {
+            let n = line;
+            if nl {
+                line += 1;
+            }
+            n
+        })
+        .collect()
+}
+
+/// 画面の上端 `top` より下にかかる最初の表示行の番号 (二分探索)。
+/// `galley_pos_y` は galley の左上の画面上の y 座標
+fn first_visible_row(galley: &egui::Galley, galley_pos_y: f32, top: f32) -> usize {
+    galley
+        .rows
+        .partition_point(|r| galley_pos_y + r.rect.max.y < top)
+}
+
+/// 検索結果のキャッシュ。検索語・検索条件・文書の版が変わったときだけ作り直す
+struct FindCache {
+    rev: u64,
+    /// 作り直すたびに変わる識別子 (表示のキャッシュの判定に使う。0 は使わない)
+    stamp: u64,
+    query: String,
+    case_sensitive: bool,
+    /// 一致箇所 (文字位置の範囲)
+    matches: Vec<(usize, usize)>,
+    /// 一致箇所 (バイト位置の範囲)。表示の強調に使う
+    byte_ranges: Vec<(usize, usize)>,
+}
+
+/// 検索結果の識別子の採番
+static FIND_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// 1つのタブ (= 1つの文書)
 struct Doc {
     id: u64,
     path: Option<PathBuf>,
     untitled_no: usize,
     text: String,
-    /// ディスク上のバイト列 (文字コードを指定して再読み込みするために保持)
-    raw: Option<Vec<u8>>,
     enc: Enc,
     eol: Eol,
     dirty: bool,
+    /// 読み込み時にデコードできないバイトがあった (U+FFFD に置き換わっている) か。
+    /// そのまま上書き保存すると、元の不正なバイトが失われる
+    lossy_load: bool,
+    /// 保存・読み込みした時点の内容。`dirty` の判定に使う
+    saved: Snapshot,
+    /// 保存・読み込みした時点のファイルの指紋。外部での変更の検出に使う
+    fingerprint: Option<Fingerprint>,
     cursor_idx: usize,
     line_col: (usize, usize),
-    /// 文字列を変更するたびに増やす版番号 (検索結果のキャッシュ判定に使う)
+    /// 文字列を変更するたびに増やす版番号 (各種キャッシュの判定に使う)
     rev: u64,
     find_cache: Option<FindCache>,
-}
-
-/// 検索結果のキャッシュ。検索語・検索条件・文書の版が変わったときだけ作り直す
-struct FindCache {
-    rev: u64,
-    query: String,
-    case_sensitive: bool,
-    /// 一致箇所 (文字位置の範囲)
-    matches: Vec<(usize, usize)>,
+    stats: Option<DocStats>,
+    layout_cache: Option<LayoutCache>,
+    row_lines: Option<RowLines>,
 }
 
 impl Doc {
+    /// 空の文書
+    fn blank(id: u64, untitled_no: usize) -> Self {
+        Doc {
+            id,
+            path: None,
+            untitled_no,
+            text: String::new(),
+            enc: Enc::Utf8,
+            eol: Eol::CrLf,
+            dirty: false,
+            lossy_load: false,
+            saved: Snapshot::of("", Enc::Utf8, Eol::CrLf),
+            fingerprint: None,
+            cursor_idx: 0,
+            line_col: (1, 1),
+            rev: 0,
+            find_cache: None,
+            stats: None,
+            layout_cache: None,
+            row_lines: None,
+        }
+    }
+
+    /// 読み込んだ内容から文書を作る
+    fn from_loaded(id: u64, path: PathBuf, l: fileio::Loaded) -> Self {
+        let mut d = Doc::blank(id, 0);
+        d.path = Some(path);
+        d.enc = l.enc;
+        d.eol = l.eol;
+        d.text = l.text;
+        d.lossy_load = l.lossy;
+        d.fingerprint = l.fingerprint;
+        d.mark_saved();
+        d
+    }
+
     fn title(&self) -> String {
         match &self.path {
             Some(p) => p
@@ -73,6 +221,44 @@ impl Doc {
         }
     }
 
+    /// いまの内容を「保存済み」として記録する
+    fn mark_saved(&mut self) {
+        self.saved = Snapshot::of(&self.text, self.enc, self.eol);
+        self.dirty = false;
+    }
+
+    /// 内容・文字コード・改行コードを変えた後に、保存済みの内容と比べて変更あり (dirty) を更新する。
+    /// 元に戻した (Undo、改行コードを戻すなど) ときは変更なしに戻る。
+    /// 大きな文書では完全な比較をせず、変更ありのままにする。
+    /// 長さが違えばハッシュは取らない (たいていの編集は長さが変わるので軽い)
+    fn update_dirty(&mut self) {
+        let s = &self.saved;
+        self.dirty = if self.enc != s.enc || self.eol != s.eol {
+            true
+        } else if !s.exact || self.text.len() > EXACT_DIRTY_LIMIT || self.text.len() != s.len {
+            true
+        } else {
+            hash_text(&self.text) != s.hash
+        };
+    }
+
+    /// (文字数, 行数)。版が変わったときだけ数え直す
+    fn stats(&mut self) -> (usize, usize) {
+        if !matches!(&self.stats, Some(s) if s.rev == self.rev) {
+            let bytes = self.text.as_bytes();
+            // UTF-8 の先頭バイト (継続バイト 10xxxxxx 以外) の数 = 文字数
+            let chars = bytes.iter().filter(|&&b| (b & 0xC0) != 0x80).count();
+            let lines = bytes.iter().filter(|&&b| b == b'\n').count() + 1;
+            self.stats = Some(DocStats {
+                rev: self.rev,
+                chars,
+                lines,
+            });
+        }
+        let s = self.stats.as_ref().unwrap();
+        (s.chars, s.lines)
+    }
+
     /// 検索結果が古ければ作り直す
     fn ensure_matches(&mut self, query: &str, case_sensitive: bool) {
         let fresh = matches!(
@@ -80,11 +266,15 @@ impl Doc {
             Some(c) if c.rev == self.rev && c.case_sensitive == case_sensitive && c.query == query
         );
         if !fresh {
+            let byte_ranges = search::find_bytes(&self.text, query, case_sensitive);
+            let matches = search::bytes_to_chars(&self.text, &byte_ranges);
             self.find_cache = Some(FindCache {
                 rev: self.rev,
+                stamp: FIND_STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 query: query.to_owned(),
                 case_sensitive,
-                matches: search::find_all(&self.text, query, case_sensitive),
+                matches,
+                byte_ranges,
             });
         }
     }
@@ -138,13 +328,19 @@ fn set_editor_sel(ctx: &egui::Context, id: egui::Id, start: usize, end: usize) {
 /// egui の Undo 履歴は編集欄にフォーカスがある間しか記録されないため、そのまま書き換えると
 /// Ctrl+Z で「置換の直前に入力した文字」まで一緒に消えてしまう。
 /// そこで書き換えの前後の状態を明示的に履歴へ積み、Ctrl+Z 1 回で置換 1 回分だけ戻るようにする。
+///
+/// 履歴のために本文を 2 回複製する。メモリが足りずに複製できないときは (確保の失敗でプロセスごと
+/// 落ちて、他のタブの編集を失わないよう) 何も変えずに false を返す。
 fn replace_text_with_undo(
     ctx: &egui::Context,
     id: egui::Id,
     text: &mut String,
     new_text: String,
     new_sel: (usize, usize),
-) {
+) -> bool {
+    let (Some(old_copy), Some(new_copy)) = (try_clone(text), try_clone(&new_text)) else {
+        return false;
+    };
     let mut state = TextEditState::load(ctx, id).unwrap_or_default();
     let old_range = state
         .cursor
@@ -152,15 +348,35 @@ fn replace_text_with_undo(
         .unwrap_or_else(|| CCursorRange::one(CCursor::new(0)));
     let new_range = CCursorRange::two(CCursor::new(new_sel.0), CCursor::new(new_sel.1));
     let mut undoer = state.undoer();
-    undoer.add_undo(&(old_range, text.clone()));
+    undoer.add_undo(&(old_range, old_copy));
     *text = new_text;
-    let new_state = (new_range, text.clone());
+    let new_state = (new_range, new_copy);
     // 新しい編集なので、Undo 後に残っている Redo を捨てる。egui 0.29 の Undoer には
     // Redo を消す API が無いが、最新の履歴と異なる状態で redo() を呼ぶと Redo が消える
     let _ = undoer.redo(&new_state);
     undoer.add_undo(&new_state);
     state.set_undoer(undoer);
     state.cursor.set_char_range(Some(new_range));
+    state.store(ctx, id);
+    true
+}
+
+/// 確保に失敗しても落ちない文字列の複製
+fn try_clone(s: &str) -> Option<String> {
+    let mut v = String::new();
+    v.try_reserve_exact(s.len()).ok()?;
+    v.push_str(s);
+    Some(v)
+}
+
+/// 編集欄の Undo 履歴とキャレットを初期状態に戻す (文書を読み直したとき、読み直す前の履歴で
+/// 別の内容に戻ってしまわないように)
+fn reset_editor_state(ctx: &egui::Context, id: egui::Id) {
+    let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+    state.set_undoer(Default::default());
+    state
+        .cursor
+        .set_char_range(Some(CCursorRange::one(CCursor::new(0))));
     state.store(ctx, id);
 }
 
@@ -516,11 +732,59 @@ fn singleline_with_preedit(
     out.response
 }
 
+/// 保存の後に続けてやること。確認の画面をはさんで保存が中断しても、確認後に元の操作を再開する
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Then {
+    /// 保存だけ
+    None,
+    /// 保存できたらそのタブ (文書の id) を閉じる
+    Close(u64),
+    /// 保存できたら、残りの未保存の文書の保存を続け、すべて終わったら終了する
+    SaveAll,
+}
+
+/// 保存の途中でユーザーが「それでよい」と答えた確認 (同じ確認を繰り返さないため)
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct Confirmed {
+    /// 読み込み時にデコードできなかったバイトが失われること
+    lossy_load: bool,
+    /// ファイルが外部で変更されていること
+    conflict: bool,
+    /// 文字コードで表現できない文字が変わること
+    lossy: bool,
+}
+
 #[derive(Clone)]
 enum Modal {
     ConfirmClose(u64),
     ConfirmExit,
-    Lossy { id: u64, path: PathBuf },
+    /// 文字コードで表現できない (または別の文字に変わる) 文字がある
+    Lossy {
+        id: u64,
+        path: PathBuf,
+        then: Then,
+        ok: Confirmed,
+        /// 変わる文字の例 ("¥ → \" の形)
+        examples: Vec<String>,
+    },
+    /// 読み込み時にデコードできなかったバイトが、上書き保存で失われる
+    LossyLoad {
+        id: u64,
+        path: PathBuf,
+        then: Then,
+        ok: Confirmed,
+    },
+    /// 読み込み後に、ファイルが他のプログラムで変更・削除された
+    Conflict {
+        id: u64,
+        path: PathBuf,
+        then: Then,
+        ok: Confirmed,
+    },
+    /// 未保存の編集を捨てて、指定した文字コードで読み直す
+    ConfirmReload { id: u64, enc: Enc },
+    /// 大きなファイルを開く確認
+    ConfirmLargeOpen { path: PathBuf, size: u64 },
     Info(String),
 }
 
@@ -542,7 +806,19 @@ enum Action {
     DiscardAndClose(u64),
     SaveAllAndExit,
     ExitNow,
-    ForceWrite(u64, PathBuf),
+    /// 確認に答えたうえで、保存を続ける
+    SaveConfirmed {
+        id: u64,
+        path: PathBuf,
+        then: Then,
+        ok: Confirmed,
+    },
+    /// 確認の画面から「名前を付けて保存」を選んだ
+    SaveAsFor(u64, Then),
+    /// 未保存の編集を捨てて読み直す
+    ReloadNow(u64, Enc),
+    /// 大きなファイルを確認のうえ開く
+    OpenAnyway(PathBuf),
     DismissModal,
     /// 検索バーを開く (true なら置換の行も表示する)
     OpenFind(bool),
@@ -570,6 +846,9 @@ struct ImeGuard {
     segs: Vec<ime::Segment>,
     /// 直近の Commit の時刻 (egui の time)
     last_commit: Option<f64>,
+    /// 直近の Commit の後に、まだ取り除ける Enter の数 (Commit のたびに 1 に戻る)。
+    /// 確定の Enter は 1 回だけなので、猶予の間でも 2 回目以降の Enter は本物の改行として通す
+    commit_enter_budget: u32,
     /// 最後の (空でない) Preedit の後に来た「空の Preedit / Disabled」の数。
     /// 最後の Preedit 以降に Commit が来ていれば None
     ends_since_preedit: Option<u32>,
@@ -624,6 +903,7 @@ impl ImeGuard {
                 self.composing = false;
                 self.preedit.clear();
                 self.last_commit = Some(time);
+                self.commit_enter_budget = 1;
                 true
             }
             egui::Event::Ime(egui::ImeEvent::Disabled) => {
@@ -636,12 +916,52 @@ impl ImeGuard {
                 pressed: true,
                 ..
             } => {
+                if self.composing {
+                    return false;
+                }
+                // 確定の直後 (猶予の間) の Enter は 1 回だけ取り除く。それ以降は本物の Enter
                 let after_commit = self.last_commit.is_some_and(|c| time - c <= Self::GRACE);
-                !(self.composing || after_commit)
+                if after_commit && self.commit_enter_budget > 0 {
+                    self.commit_enter_budget -= 1;
+                    return false;
+                }
+                true
             }
             _ => true,
         });
     }
+}
+
+/// バックグラウンドの読み込みの種類
+enum LoadKind {
+    /// 新しいタブで開く
+    Open,
+    /// 開いている文書を、文字コードを指定して読み直す
+    Reload { doc_id: u64 },
+}
+
+/// バックグラウンドのスレッドで実行中の読み込み
+struct PendingLoad {
+    path: PathBuf,
+    /// 同じファイルかどうかの判定用 (`fileio::path_key`)
+    key: String,
+    kind: LoadKind,
+    rx: mpsc::Receiver<Result<fileio::Loaded, String>>,
+}
+
+/// 読み込みの結果を伝える状態表示 (デコードエラー・改行コードの混在)
+fn load_notes(lossy: bool, mixed_eol: bool, eol: Eol) -> String {
+    let mut s = String::new();
+    if lossy {
+        s.push_str(" ※デコードできないバイトがありました");
+    }
+    if mixed_eol {
+        s.push_str(&format!(
+            " ※改行コードが混在しています。保存時は {} に統一されます",
+            eol.label()
+        ));
+    }
+    s
 }
 
 struct App {
@@ -663,11 +983,27 @@ struct App {
     find: FindState,
     /// 一致箇所を画面内にスクロールする要求 (文書id, 文字位置)。次の描画で処理する
     scroll_req: Option<(u64, usize)>,
+    /// バックグラウンドスレッドから描画を促すために使う
+    ctx: egui::Context,
+    /// 実行中の読み込み
+    loads: Vec<PendingLoad>,
+    /// タブの列をスクロールして見せ終わった、選択中の文書 (選択が変わったときだけスクロールする)
+    tab_shown: Option<u64>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
+        let mut app = App::blank(cc.egui_ctx.clone());
+        // コマンドライン引数 (「プログラムから開く」やexeへのドラッグ&ドロップ) のファイルを開く
+        for arg in std::env::args_os().skip(1) {
+            app.open_path(PathBuf::from(arg));
+        }
+        app
+    }
+
+    /// 空のタブ 1 つだけの状態
+    fn blank(ctx: egui::Context) -> Self {
         let mut app = App {
             docs: Vec::new(),
             active: 0,
@@ -685,12 +1021,11 @@ impl App {
             last_title: String::new(),
             find: FindState::default(),
             scroll_req: None,
+            ctx,
+            loads: Vec::new(),
+            tab_shown: None,
         };
         app.new_doc();
-        // コマンドライン引数 (「プログラムから開く」やexeへのドラッグ&ドロップ) のファイルを開く
-        for arg in std::env::args_os().skip(1) {
-            app.open_path(PathBuf::from(arg));
-        }
         app
     }
 
@@ -703,23 +1038,19 @@ impl App {
         self.docs.iter().position(|d| d.id == id)
     }
 
+    /// 同じファイル (`fileio::path_key` が等しい) を開いているタブ
+    fn find_doc_by_key(&self, key: &str) -> Option<usize> {
+        self.docs.iter().position(|d| {
+            d.path
+                .as_deref()
+                .is_some_and(|p| fileio::path_key(p) == key)
+        })
+    }
+
     fn new_doc(&mut self) {
         self.untitled_counter += 1;
         let id = self.alloc_id();
-        self.docs.push(Doc {
-            id,
-            path: None,
-            untitled_no: self.untitled_counter,
-            text: String::new(),
-            raw: None,
-            enc: Enc::Utf8,
-            eol: Eol::CrLf,
-            dirty: false,
-            cursor_idx: 0,
-            line_col: (1, 1),
-            rev: 0,
-            find_cache: None,
-        });
+        self.docs.push(Doc::blank(id, self.untitled_counter));
         self.active = self.docs.len() - 1;
         self.focus_editor = true;
     }
@@ -750,78 +1081,173 @@ impl App {
     }
 
     fn open_path(&mut self, path: PathBuf) {
-        // 既に開いているファイルならそのタブに切り替える
-        if let Some(i) = self
-            .docs
-            .iter()
-            .position(|d| d.path.as_ref() == Some(&path))
-        {
+        self.open_path_checked(path, false);
+    }
+
+    /// ファイルを開く。既に開いている (または読み込み中の) ファイルなら、そのタブに切り替えるだけ。
+    /// 大きなファイルは `confirmed_large` でなければ、先に確認する
+    fn open_path_checked(&mut self, path: PathBuf, confirmed_large: bool) {
+        let key = fileio::path_key(&path);
+        if let Some(i) = self.find_doc_by_key(&key) {
             self.active = i;
             self.focus_editor = true;
             return;
         }
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
+        if self.loads.iter().any(|l| l.key == key) {
+            self.status = format!("{} は読み込み中です", path.display());
+            return;
+        }
+        if !confirmed_large {
+            if let Ok(m) = std::fs::metadata(&path) {
+                if m.len() > fileio::LARGE_FILE_BYTES {
+                    self.modal = Some(Modal::ConfirmLargeOpen { path, size: m.len() });
+                    return;
+                }
+            }
+        }
+        self.start_load(path, key, LoadKind::Open, None);
+    }
+
+    /// 読み込みをバックグラウンドのスレッドで始める (読み込み中も他のタブを操作できる)
+    fn start_load(&mut self, path: PathBuf, key: String, kind: LoadKind, forced: Option<Enc>) {
+        let (tx, rx) = mpsc::channel();
+        let ctx = self.ctx.clone();
+        let p = path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("load".into())
+            .spawn(move || {
+                let _ = tx.send(fileio::load(&p, forced));
+                ctx.request_repaint();
+            });
+        if let Err(e) = spawned {
+            self.modal = Some(Modal::Info(format!(
+                "ファイルを読み込めませんでした:\n{}\n\n{}",
+                path.display(),
+                e
+            )));
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.status = format!("読み込み中… {name}");
+        self.loads.push(PendingLoad {
+            path,
+            key,
+            kind,
+            rx,
+        });
+    }
+
+    /// 終わった読み込みを取り込む (毎フレーム呼ぶ)
+    fn poll_loads(&mut self, ctx: &egui::Context) {
+        let mut finished = Vec::new();
+        let mut i = 0;
+        while i < self.loads.len() {
+            match self.loads[i].rx.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => i += 1,
+                Ok(r) => finished.push((self.loads.remove(i), r)),
+                Err(mpsc::TryRecvError::Disconnected) => finished.push((
+                    self.loads.remove(i),
+                    Err("読み込みが中断されました".to_string()),
+                )),
+            }
+        }
+        for (l, r) in finished {
+            self.finish_load(ctx, l, r);
+        }
+    }
+
+    fn finish_load(
+        &mut self,
+        ctx: &egui::Context,
+        l: PendingLoad,
+        result: Result<fileio::Loaded, String>,
+    ) {
+        let PendingLoad { path, key, kind, .. } = l;
+        match (kind, result) {
+            (LoadKind::Open, Err(e)) => {
                 self.modal = Some(Modal::Info(format!(
                     "ファイルを開けませんでした:\n{}\n\n{}",
                     path.display(),
                     e
                 )));
-                return;
             }
-        };
-        let enc = encoding::detect(&bytes);
-        let (text, err) = encoding::decode(&bytes, enc);
-        let eol = encoding::detect_eol(&text);
-        let text = encoding::normalize_eol(text);
-        let id = self.alloc_id();
-        let doc = Doc {
-            id,
-            path: Some(path),
-            untitled_no: 0,
-            text,
-            raw: Some(bytes),
-            enc,
-            eol,
-            dirty: false,
-            cursor_idx: 0,
-            line_col: (1, 1),
-            rev: 0,
-            find_cache: None,
-        };
-        self.status = format!(
-            "{} を開きました ({} / {}){}",
-            doc.title(),
-            enc.label(),
-            eol.label(),
-            if err {
-                " ※デコードできないバイトがありました"
-            } else {
-                ""
+            (LoadKind::Reload { .. }, Err(e)) => {
+                self.modal = Some(Modal::Info(format!(
+                    "読み直せませんでした (文書はそのままです):\n{}\n\n{}",
+                    path.display(),
+                    e
+                )));
             }
-        );
-        // 未編集の空タブ1つだけなら置き換える
-        let replace = self.docs.len() == 1
-            && self.docs[0].path.is_none()
-            && !self.docs[0].dirty
-            && self.docs[0].text.is_empty();
-        if replace {
-            self.docs[0] = doc;
-            self.active = 0;
-        } else {
-            self.docs.push(doc);
-            self.active = self.docs.len() - 1;
+            (LoadKind::Open, Ok(loaded)) => {
+                // 読み込み中に、別の経路 (名前を付けて保存など) で同じファイルが開かれていたら切り替えるだけ
+                if let Some(i) = self.find_doc_by_key(&key) {
+                    self.active = i;
+                    self.focus_editor = true;
+                    return;
+                }
+                let notes = load_notes(loaded.lossy, loaded.mixed_eol, loaded.eol);
+                let id = self.alloc_id();
+                let doc = Doc::from_loaded(id, path, loaded);
+                self.status = format!(
+                    "{} を開きました ({} / {}){}",
+                    doc.title(),
+                    doc.enc.label(),
+                    doc.eol.label(),
+                    notes
+                );
+                // 未編集の空タブ1つだけなら置き換える
+                let replace = self.docs.len() == 1
+                    && self.docs[0].path.is_none()
+                    && !self.docs[0].dirty
+                    && self.docs[0].text.is_empty();
+                if replace {
+                    self.docs[0] = doc;
+                    self.active = 0;
+                } else {
+                    self.docs.push(doc);
+                    self.active = self.docs.len() - 1;
+                }
+                self.focus_editor = true;
+            }
+            (LoadKind::Reload { doc_id }, Ok(loaded)) => {
+                let Some(i) = self.index_of(doc_id) else {
+                    return; // 読み込み中にタブが閉じられた
+                };
+                let notes = load_notes(loaded.lossy, loaded.mixed_eol, loaded.eol);
+                let d = &mut self.docs[i];
+                d.text = loaded.text;
+                d.enc = loaded.enc;
+                d.eol = loaded.eol;
+                d.lossy_load = loaded.lossy;
+                d.fingerprint = loaded.fingerprint;
+                d.mark_saved();
+                d.rev += 1;
+                d.cursor_idx = 0;
+                d.line_col = (1, 1);
+                // 読み直す前の Undo 履歴で、別の内容に戻ってしまわないようにする
+                reset_editor_state(ctx, editor_id(d.id));
+                self.status = format!("{} として再読み込みしました{}", d.enc.label(), notes);
+                self.focus_editor = true;
+            }
         }
-        self.focus_editor = true;
     }
 
-    /// 保存。成功したら true
-    fn save(&mut self, idx: usize, save_as: bool) -> bool {
-        let path = match (&self.docs[idx].path, save_as) {
+    /// 保存。成功 (または保存する変更がない) なら true。
+    /// 確認の画面を出して中断したとき、保存に失敗したとき、キャンセルしたときは false
+    fn try_save(&mut self, ctx: &egui::Context, idx: usize, save_as: bool, then: Then) -> bool {
+        let d = &self.docs[idx];
+        // 変更のない文書の上書き保存では何も書かない (デコードできなかったバイトや、
+        // 混在していた改行コードを、意図せず書き換えてしまわないように)
+        if !save_as && d.path.is_some() && !d.dirty {
+            self.status = format!("{} に変更はありません", d.title());
+            return true;
+        }
+        let path = match (&d.path, save_as) {
             (Some(p), false) => p.clone(),
             _ => {
-                let d = &self.docs[idx];
                 let name = if d.path.is_some() {
                     d.title()
                 } else {
@@ -840,40 +1266,168 @@ impl App {
                 }
             }
         };
-        self.write(idx, path, false)
+        self.write_doc(ctx, idx, path, then, Confirmed::default())
     }
 
-    fn write(&mut self, idx: usize, path: PathBuf, force: bool) -> bool {
-        let d = &self.docs[idx];
-        let out = encoding::apply_eol(&d.text, d.eol);
-        let (bytes, lossy) = encoding::encode(&out, d.enc);
-        if lossy && !force {
-            self.modal = Some(Modal::Lossy { id: d.id, path });
+    /// 保存して、成功したら続きの操作 (`then`) を行う
+    fn save_then(&mut self, ctx: &egui::Context, idx: usize, save_as: bool, then: Then) -> bool {
+        let ok = self.try_save(ctx, idx, save_as, then);
+        if ok {
+            self.resume(ctx, then);
+        }
+        ok
+    }
+
+    /// 保存の後に続けてやることを行う
+    fn resume(&mut self, ctx: &egui::Context, then: Then) {
+        match then {
+            Then::None => {}
+            Then::Close(id) => {
+                if let Some(i) = self.index_of(id) {
+                    self.close_now(i);
+                }
+            }
+            Then::SaveAll => self.save_all_and_exit(ctx),
+        }
+    }
+
+    /// 未保存の文書をすべて保存して終了する。確認の画面で止まったときは、
+    /// その確認に答えた後で (`Then::SaveAll`) ここへ戻って続きを行う
+    fn save_all_and_exit(&mut self, ctx: &egui::Context) {
+        self.modal = None;
+        let mut i = 0;
+        while i < self.docs.len() {
+            if self.docs[i].dirty {
+                self.active = i;
+                if !self.try_save(ctx, i, false, Then::SaveAll) {
+                    return; // キャンセル・失敗・確認待ちのときは終了を中止
+                }
+            }
+            i += 1;
+        }
+        self.allow_exit = true;
+        ctx.send_viewport_cmd(ViewportCommand::Close);
+    }
+
+    /// 文書を `path` に保存する。各種の確認 (`ok` で答え済みのものは省く) が必要なら、
+    /// 確認の画面を設定して false を返す。保存できたら true
+    fn write_doc(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        path: PathBuf,
+        then: Then,
+        ok: Confirmed,
+    ) -> bool {
+        let key = fileio::path_key(&path);
+        // 別のタブで開いているファイルへは保存しない (同じファイルの二重管理になるため)
+        let open_elsewhere = self.docs.iter().enumerate().any(|(i, d)| {
+            i != idx
+                && d.path
+                    .as_deref()
+                    .is_some_and(|p| fileio::path_key(p) == key)
+        }) || self
+            .loads
+            .iter()
+            .any(|l| matches!(l.kind, LoadKind::Open) && l.key == key);
+        if open_elsewhere {
+            self.modal = Some(Modal::Info(format!(
+                "そのファイルは別のタブで開いています:\n{}",
+                path.display()
+            )));
             return false;
         }
-        match std::fs::write(&path, &bytes) {
-            Ok(()) => {
-                let d = &mut self.docs[idx];
-                d.path = Some(path);
-                d.raw = Some(bytes);
-                d.dirty = false;
-                self.status = format!(
-                    "{} を保存しました ({} / {})",
-                    d.title(),
-                    d.enc.label(),
-                    d.eol.label()
-                );
-                true
-            }
-            Err(e) => {
-                self.modal = Some(Modal::Info(format!(
-                    "保存に失敗しました:\n{}\n\n{}",
-                    path.display(),
-                    e
-                )));
-                false
+
+        let d = &self.docs[idx];
+        let id = d.id;
+        let same_file = d
+            .path
+            .as_deref()
+            .is_some_and(|p| fileio::path_key(p) == key);
+        // 元のファイルへの上書きでは、デコードできなかったバイトが失われる
+        if same_file && d.lossy_load && !ok.lossy_load {
+            self.modal = Some(Modal::LossyLoad {
+                id,
+                path,
+                then,
+                ok,
+            });
+            return false;
+        }
+        // 読み込み後に、他のプログラムがファイルを変更・削除していないか
+        if same_file && !ok.conflict {
+            if let Some(fp) = &d.fingerprint {
+                if fileio::changed_since(fp, &path) {
+                    self.modal = Some(Modal::Conflict {
+                        id,
+                        path,
+                        then,
+                        ok,
+                    });
+                    return false;
+                }
             }
         }
+        let out = encoding::apply_eol(&d.text, d.eol);
+        let (bytes, lossy) = encoding::encode(&out, d.enc);
+        drop(out);
+        if lossy && !ok.lossy {
+            self.modal = Some(Modal::Lossy {
+                id,
+                path,
+                then,
+                ok,
+                examples: encoding::lossy_examples(&d.text, d.enc, 5),
+            });
+            return false;
+        }
+        if let Err(e) = fileio::atomic_write(&path, &bytes) {
+            // 元のファイルはそのまま。変更ありのままにする
+            self.modal = Some(Modal::Info(format!(
+                "保存に失敗しました:\n{}\n\n{}",
+                path.display(),
+                e
+            )));
+            return false;
+        }
+
+        let d = &mut self.docs[idx];
+        d.path = Some(path.clone());
+        d.fingerprint = fileio::fingerprint(&path);
+        d.lossy_load = false;
+        let mut note = String::new();
+        let mut in_sync = true;
+        if lossy {
+            // 画面の文字を、実際に書き込んだ内容 (開き直したときに見える文字) にそろえる。
+            // 履歴に積むので、Ctrl+Z で元の文字に戻せる
+            let (back, _) = encoding::decode(&bytes, d.enc);
+            let back = encoding::normalize_eol(back);
+            if back != d.text {
+                let cur = d.cursor_idx.min(back.chars().count());
+                if replace_text_with_undo(ctx, editor_id(d.id), &mut d.text, back, (cur, cur)) {
+                    d.rev += 1;
+                    d.cursor_idx = cur;
+                    d.line_col = line_col(&d.text, cur);
+                    note = " ※一部の文字は保存形式に合わせて変わりました (Ctrl+Z で戻せます)".into();
+                } else {
+                    in_sync = false;
+                    note = " ※メモリが足りず、画面の文字を保存内容にそろえられませんでした".into();
+                }
+            }
+        }
+        if in_sync {
+            d.mark_saved();
+        } else {
+            d.dirty = true;
+        }
+        self.status = format!(
+            "{} を保存しました ({} / {}){}",
+            d.title(),
+            d.enc.label(),
+            d.eol.label(),
+            note
+        );
+        true
     }
 
     fn request_close(&mut self, idx: usize) {
@@ -897,29 +1451,39 @@ impl App {
         self.focus_editor = true;
     }
 
-    /// 文字コードを指定してディスクから読み直す (文字化けの修正用)
-    fn reload_as(&mut self, enc: Enc) {
-        let d = &mut self.docs[self.active];
-        let Some(raw) = &d.raw else {
+    /// 文字コードを指定してディスクから読み直す (文字化けの修正用)。
+    /// 未保存の編集があるときは、捨ててよいか先に確認する
+    fn request_reload(&mut self, enc: Enc) {
+        let d = &self.docs[self.active];
+        if d.path.is_none() {
             self.status = "保存されていない文書は再読み込みできません".into();
             return;
+        }
+        if d.dirty {
+            self.modal = Some(Modal::ConfirmReload { id: d.id, enc });
+        } else {
+            self.start_reload(d.id, enc);
+        }
+    }
+
+    /// ディスクのファイルをもう一度読み込んで、文書を置き換える (読み込み中の内容は変えない)
+    fn start_reload(&mut self, id: u64, enc: Enc) {
+        let Some(i) = self.index_of(id) else {
+            return;
         };
-        let (text, err) = encoding::decode(raw, enc);
-        d.eol = encoding::detect_eol(&text);
-        d.text = encoding::normalize_eol(text);
-        d.enc = enc;
-        d.dirty = false;
-        d.rev += 1;
-        d.cursor_idx = usize::MAX;
-        self.status = format!(
-            "{} として再読み込みしました{}",
-            enc.label(),
-            if err {
-                " ※デコードできないバイトがありました"
-            } else {
-                ""
-            }
-        );
+        let Some(path) = self.docs[i].path.clone() else {
+            return;
+        };
+        let pending = self
+            .loads
+            .iter()
+            .any(|l| matches!(l.kind, LoadKind::Reload { doc_id } if doc_id == id));
+        if pending {
+            self.status = "読み込み中です".into();
+            return;
+        }
+        let key = fileio::path_key(&path);
+        self.start_load(path, key, LoadKind::Reload { doc_id: id }, Some(enc));
     }
 
     /// 保存時の文字コードを変更する (文字コード変換)
@@ -931,7 +1495,7 @@ impl App {
         let from = d.enc.label();
         let (_, lossy) = encoding::encode(&d.text, enc);
         d.enc = enc;
-        d.dirty = true;
+        d.update_dirty();
         self.status = if lossy {
             format!(
                 "⚠ {} → {} に変換: この文字コードで表現できない文字があります (保存時に確認します)",
@@ -951,7 +1515,7 @@ impl App {
         let d = &mut self.docs[self.active];
         if d.eol != eol {
             d.eol = eol;
-            d.dirty = true;
+            d.update_dirty();
             self.status = format!(
                 "改行コードを {} に変更しました。保存すると反映されます",
                 eol.label()
@@ -1031,16 +1595,31 @@ impl App {
         }
         let bs = search::char_to_byte(&d.text, sel_s);
         let be = search::char_to_byte(&d.text, sel_e);
-        let mut new_text = d.text.clone();
-        new_text.replace_range(bs..be, &repl);
+        let new_text = match search::replace_ranges(
+            &d.text,
+            &[(bs, be)],
+            &repl,
+            search::MAX_REPLACE_RESULT,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                self.modal = Some(Modal::Info(replace_error_message(&e)));
+                return;
+            }
+        };
         let cur = sel_s + repl.chars().count();
         // 置換後の本文で次の一致を探し、それを選択した状態にする
         let new_matches = search::find_all(&new_text, &query, cs);
         let next = search::next_index(&new_matches, cur).map(|i| new_matches[i]);
         let (ts, te) = next.unwrap_or((cur, cur));
-        replace_text_with_undo(ctx, id, &mut d.text, new_text, (ts, te));
-        d.dirty = true;
+        if !replace_text_with_undo(ctx, id, &mut d.text, new_text, (ts, te)) {
+            self.modal = Some(Modal::Info(replace_error_message(
+                &search::ReplaceError::OutOfMemory,
+            )));
+            return;
+        }
         d.rev += 1;
+        d.update_dirty();
         d.cursor_idx = te;
         d.line_col = line_col(&d.text, te);
         let doc_id = d.id;
@@ -1066,15 +1645,37 @@ impl App {
         let cs = self.find.case_sensitive;
         let (query, repl) = (self.find.query.clone(), self.find.replacement.clone());
         let d = &mut self.docs[self.active];
-        let (new_text, n) = search::replace_all(&d.text, &query, &repl, cs);
+        d.ensure_matches(&query, cs);
+        let Some(cache) = d.find_cache.as_ref() else {
+            return;
+        };
+        let n = cache.byte_ranges.len();
         if n == 0 {
             self.status = "見つかりません".into();
             return;
         }
+        // 置換後の大きさを先に計算し、上限を超えるときは何も複製せずに断る
+        let new_text = match search::replace_ranges(
+            &d.text,
+            &cache.byte_ranges,
+            &repl,
+            search::MAX_REPLACE_RESULT,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                self.modal = Some(Modal::Info(replace_error_message(&e)));
+                return;
+            }
+        };
         let cur = d.cursor_idx.min(new_text.chars().count());
-        replace_text_with_undo(ctx, editor_id(d.id), &mut d.text, new_text, (cur, cur));
-        d.dirty = true;
+        if !replace_text_with_undo(ctx, editor_id(d.id), &mut d.text, new_text, (cur, cur)) {
+            self.modal = Some(Modal::Info(replace_error_message(
+                &search::ReplaceError::OutOfMemory,
+            )));
+            return;
+        }
         d.rev += 1;
+        d.update_dirty();
         d.cursor_idx = cur;
         d.line_col = line_col(&d.text, cur);
         self.focus_editor = true;
@@ -1096,10 +1697,10 @@ impl App {
             Action::New => self.new_doc(),
             Action::Open => self.open_dialog(),
             Action::Save => {
-                self.save(self.active, false);
+                self.save_then(ctx, self.active, false, Then::None);
             }
             Action::SaveAs => {
-                self.save(self.active, true);
+                self.save_then(ctx, self.active, true, Then::None);
             }
             Action::Select(i) => {
                 if i < self.docs.len() {
@@ -1122,15 +1723,13 @@ impl App {
                 self.focus_editor = true;
             }
             Action::Exit => ctx.send_viewport_cmd(ViewportCommand::Close),
-            Action::Reload(e) => self.reload_as(e),
+            Action::Reload(e) => self.request_reload(e),
             Action::Convert(e) => self.convert_to(e),
             Action::SetEol(e) => self.set_eol(e),
             Action::SaveAndClose(id) => {
                 self.modal = None;
                 if let Some(i) = self.index_of(id) {
-                    if self.save(i, false) {
-                        self.close_now(i);
-                    }
+                    self.save_then(ctx, i, false, Then::Close(id));
                 }
             }
             Action::DiscardAndClose(id) => {
@@ -1139,31 +1738,38 @@ impl App {
                     self.close_now(i);
                 }
             }
-            Action::SaveAllAndExit => {
-                self.modal = None;
-                let mut i = 0;
-                while i < self.docs.len() {
-                    if self.docs[i].dirty {
-                        self.active = i;
-                        if !self.save(i, false) {
-                            return; // キャンセルまたは失敗したら終了を中止
-                        }
-                    }
-                    i += 1;
-                }
-                self.allow_exit = true;
-                ctx.send_viewport_cmd(ViewportCommand::Close);
-            }
+            Action::SaveAllAndExit => self.save_all_and_exit(ctx),
             Action::ExitNow => {
                 self.modal = None;
                 self.allow_exit = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
-            Action::ForceWrite(id, path) => {
+            Action::SaveConfirmed {
+                id,
+                path,
+                then,
+                ok,
+            } => {
                 self.modal = None;
                 if let Some(i) = self.index_of(id) {
-                    self.write(i, path, true);
+                    if self.write_doc(ctx, i, path, then, ok) {
+                        self.resume(ctx, then);
+                    }
                 }
+            }
+            Action::SaveAsFor(id, then) => {
+                self.modal = None;
+                if let Some(i) = self.index_of(id) {
+                    self.save_then(ctx, i, true, then);
+                }
+            }
+            Action::ReloadNow(id, enc) => {
+                self.modal = None;
+                self.start_reload(id, enc);
+            }
+            Action::OpenAnyway(path) => {
+                self.modal = None;
+                self.open_path_checked(path, true);
             }
             Action::DismissModal => self.modal = None,
         }
@@ -1244,7 +1850,7 @@ impl App {
             });
 
             let cur = self.docs[self.active].enc;
-            let has_raw = self.docs[self.active].raw.is_some();
+            let has_path = self.docs[self.active].path.is_some();
             ui.menu_button("文字コード", |ui| {
                 ui.label(format!("現在: {}", cur.label()));
                 ui.separator();
@@ -1258,9 +1864,9 @@ impl App {
                         }
                     }
                 });
-                ui.add_enabled_ui(has_raw, |ui| {
+                ui.add_enabled_ui(has_path, |ui| {
                     ui.menu_button("指定した文字コードで開き直す", |ui| {
-                        ui.label("文字化けしたときに使います (未保存の編集は破棄されます)");
+                        ui.label("文字化けしたときに使います (ディスクから読み直します。未保存の編集は確認のうえ破棄)");
                         ui.separator();
                         for e in Enc::all() {
                             if ui.radio(cur == e, e.label()).clicked() {
@@ -1319,6 +1925,10 @@ impl App {
     }
 
     fn tab_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Action>) {
+        // 選択が変わったときだけ、選択中のタブが見えるまでタブの列をスクロールする
+        // (Ctrl+Tab でタブが多いとき、選択中のタブが画面の外に出てしまうため)
+        let active_id = self.docs[self.active].id;
+        let scroll_to_active = self.tab_shown != Some(active_id);
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, d) in self.docs.iter().enumerate() {
@@ -1346,7 +1956,7 @@ impl App {
                         } else {
                             egui::Stroke::NONE
                         });
-                    frame.show(ui, |ui| {
+                    let shown = frame.show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let r = ui.selectable_label(selected, title);
                             let r = match &d.path {
@@ -1364,6 +1974,9 @@ impl App {
                             }
                         });
                     });
+                    if selected && scroll_to_active {
+                        shown.response.scroll_to_me(None);
+                    }
                 }
                 if ui
                     .button(" + ")
@@ -1374,6 +1987,7 @@ impl App {
                 }
             });
         });
+        self.tab_shown = Some(active_id);
     }
 
     /// 検索・置換バー (開いているときだけ表示)
@@ -1410,7 +2024,8 @@ impl App {
             String::new()
         };
 
-        ui.horizontal(|ui| {
+        // 幅が狭いときは折り返して、ボタンが欄の外に切れないようにする
+        ui.horizontal_wrapped(|ui| {
             ui.label("検索:");
             let r = singleline_with_preedit(ui, &mut self.find.query, Some(qid), composing, &segs);
             if std::mem::take(&mut self.find.focus_query) {
@@ -1428,15 +2043,13 @@ impl App {
             }
             ui.checkbox(&mut self.find.case_sensitive, "大文字/小文字を区別");
             ui.label(label);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("×").on_hover_text("閉じる (Esc)").clicked() {
-                    acts.push(Action::CloseFind);
-                }
-            });
+            if ui.small_button("×").on_hover_text("閉じる (Esc)").clicked() {
+                acts.push(Action::CloseFind);
+            }
         });
 
         if self.find.show_replace {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("置換:");
                 singleline_with_preedit(ui, &mut self.find.replacement, None, composing, &segs);
                 if ui
@@ -1455,8 +2068,13 @@ impl App {
 
     fn status_bar(&self, ui: &mut egui::Ui) {
         let d = &self.docs[self.active];
+        let chars = d.stats.as_ref().map_or(0, |s| s.chars);
         ui.horizontal(|ui| {
             ui.label(&self.status);
+            if !self.loads.is_empty() {
+                ui.spinner();
+                ui.label("読み込み中…");
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.weak(format!("{} v{}", APP_NAME, APP_VERSION));
                 ui.separator();
@@ -1464,7 +2082,7 @@ impl App {
                 ui.separator();
                 ui.label(d.eol.label());
                 ui.separator();
-                ui.label(format!("{} 文字", d.text.chars().count()));
+                ui.label(format!("{} 文字", chars));
                 ui.separator();
                 ui.label(format!("{} 行, {} 列", d.line_col.0, d.line_col.1));
             });
@@ -1497,29 +2115,39 @@ impl App {
             // 文書や検索語が変わったときだけ一致を数え直す
             d.ensure_matches(&self.find.query, cs);
         }
-        let matches: &[(usize, usize)] = if find_on {
-            d.find_cache
-                .as_ref()
-                .map(|c| c.matches.as_slice())
-                .unwrap_or(&[])
-        } else {
-            &[]
-        };
+        // 行数は版が変わったときだけ数え直す
+        let (_, line_count) = d.stats();
+        let rev = d.rev;
+        // 以降は欄ごとに独立して借りる (本文を TextEdit に渡しながら、キャッシュも更新するため)
+        let Doc {
+            text,
+            find_cache,
+            layout_cache,
+            row_lines,
+            cursor_idx,
+            line_col: line_col_pos,
+            id: doc_id,
+            ..
+        } = &mut *d;
+        let doc_id = *doc_id;
+        let find_cache = if find_on { find_cache.as_ref() } else { None };
+        let matches: &[(usize, usize)] = find_cache.map_or(&[], |c| c.matches.as_slice());
+        let byte_ranges: &[(usize, usize)] = find_cache.map_or(&[], |c| c.byte_ranges.as_slice());
+        let find_stamp = find_cache.map_or(0, |c| c.stamp);
         // 選択がちょうど一致箇所と同じなら、それを「現在の一致」として濃く表示する
         let exact = editor_sel(ui.ctx(), id).and_then(|sel| matches.iter().position(|&m| m == sel));
         let colors = match_colors(dark);
 
         // 行番号の桁数 (行数は改行の数から求める)
-        let line_count = d.text.bytes().filter(|&b| b == b'\n').count() + 1;
         let digits = line_count.to_string().len();
-        let cur_line = d.line_col.0;
+        let cur_line = line_col_pos.0;
 
         let scroll = if wrap {
             egui::ScrollArea::vertical()
         } else {
             egui::ScrollArea::both()
         };
-        ui.horizontal_top(|ui| {
+        let changed = ui.horizontal_top(|ui| {
             // 行番号の欄はスクロール領域の「外」に置く。横スクロールしても左端に固定され、
             // 縦位置だけを本文 (galley) の位置に合わせて描く
             let gutter = if show_ln {
@@ -1534,35 +2162,62 @@ impl App {
                 None
             };
             let shown = scroll
-                .id_salt(("scroll", d.id))
+                .id_salt(("scroll", doc_id))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    // この描画で何回目のレイアウトか。egui の TextEdit は、描画の最初に 1 回
+                    // (編集前の本文で) レイアウトし、入力で本文が変わった場合だけもう一度
+                    // (編集後の本文で) レイアウトする。版番号 (rev) は描画の後で上げるので、
+                    // キャッシュを使えるのは 1 回目だけ。2 回目は本文が変わっているため、
+                    // キャッシュの読み書きも検索結果 (古い位置) の強調もしない
+                    let calls = std::cell::Cell::new(0u32);
                     let mut layouter = |ui: &egui::Ui, s: &str, wrap_width: f32| {
+                        let first = calls.get() == 0;
+                        calls.set(calls.get() + 1);
+                        let text_color = ui.visuals().text_color();
+                        let key = LayoutKey {
+                            rev,
+                            wrap_width: if wrap { wrap_width.to_bits() } else { 0 },
+                            font_size: font.size.to_bits(),
+                            text_color,
+                            dark,
+                            pixels_per_point: ui.ctx().pixels_per_point().to_bits(),
+                            find_stamp,
+                            exact,
+                        };
+                        if first {
+                            if let Some(c) = layout_cache.as_ref() {
+                                if c.key == key {
+                                    return c.galley.clone();
+                                }
+                            }
+                        }
                         let mut job = egui::text::LayoutJob::simple(
                             s.to_owned(),
                             font.clone(),
-                            ui.visuals().text_color(),
+                            text_color,
                             if wrap { wrap_width } else { f32::INFINITY },
                         );
-                        if !matches.is_empty() {
-                            let ranges = search::to_byte_ranges(s, matches);
+                        if first && !byte_ranges.is_empty() {
                             let sections = highlight_sections(
-                                s,
-                                &font,
-                                ui.visuals().text_color(),
-                                &ranges,
-                                exact,
-                                colors,
+                                s, &font, text_color, byte_ranges, exact, colors,
                             );
                             if !sections.is_empty() {
                                 job.sections = sections;
                             }
                         }
-                        ui.fonts(|f| f.layout_job(job))
+                        let galley = ui.fonts(|f| f.layout_job(job));
+                        if first {
+                            *layout_cache = Some(LayoutCache {
+                                key,
+                                galley: galley.clone(),
+                            });
+                        }
+                        galley
                     };
                     let old_fill = hide_selection_fill(ui, composing);
                     let fill_slot = reserve_preedit_slot(ui);
-                    let out = egui::TextEdit::multiline(&mut d.text)
+                    let out = egui::TextEdit::multiline(&mut *text)
                         .id(id)
                         .frame(false)
                         .lock_focus(true)
@@ -1576,21 +2231,18 @@ impl App {
                         .show(ui);
                     ui.visuals_mut().selection.bg_fill = old_fill;
                     paint_preedit_for(ui, &out, composing, &segs, old_fill, fill_slot);
-                    if out.response.changed() {
-                        d.dirty = true;
-                        d.rev += 1;
-                    }
+                    let changed = out.response.changed();
                     if let Some(cr) = out.cursor_range {
                         let idx = cr.primary.ccursor.index;
-                        if idx != d.cursor_idx || out.response.changed() {
-                            d.cursor_idx = idx;
-                            d.line_col = line_col(&d.text, idx);
+                        if idx != *cursor_idx || changed {
+                            *cursor_idx = idx;
+                            *line_col_pos = line_col(text, idx);
                         }
                     }
 
                     // 一致箇所を画面内に表示する (折り返し後の位置を含めて galley から求める)
-                    if let Some((doc_id, idx)) = scroll_req {
-                        if doc_id == d.id {
+                    if let Some((req_id, idx)) = scroll_req {
+                        if req_id == doc_id {
                             let rect = out
                                 .galley
                                 .pos_from_ccursor(CCursor::new(idx))
@@ -1599,25 +2251,33 @@ impl App {
                         }
                     }
 
-                    (out.galley.clone(), out.galley_pos)
+                    (out.galley.clone(), out.galley_pos, changed)
                 });
-            let (galley, galley_pos) = shown.inner;
+            let (galley, galley_pos, changed) = shown.inner;
 
-            // 行番号: 論理行の先頭の行 (折り返しの 2 行目以降は番号を付けない) にだけ描く
+            // 行番号: 論理行の先頭の行 (折り返しの 2 行目以降は番号を付けない) にだけ描く。
+            // 見えている行から描く (表示行の先頭からたどらない)
             if let Some(g) = gutter {
                 let painter = ui.painter_at(g);
                 painter.rect_filled(g, 0.0, ui.visuals().faint_bg_color);
                 let weak = ui.visuals().weak_text_color();
                 let strong = ui.visuals().strong_text_color();
-                let mut line_no = 1;
-                let mut line_start = true;
-                for row in &galley.rows {
+                let lines = row_lines_for(row_lines, &galley);
+                let first = first_visible_row(&galley, galley_pos.y, g.top());
+                for i in first..galley.rows.len() {
+                    let row = &galley.rows[i];
                     let y = galley_pos.y + row.rect.min.y;
                     if y > g.bottom() {
                         break; // 以降は画面の下 (描く必要なし)
                     }
-                    if line_start && y + row.rect.height() >= g.top() {
-                        let color = if line_no == cur_line { strong } else { weak };
+                    let line_no = lines[i];
+                    let line_start = i == 0 || lines[i - 1] != line_no;
+                    if line_start {
+                        let color = if line_no as usize == cur_line {
+                            strong
+                        } else {
+                            weak
+                        };
                         painter.text(
                             egui::pos2(g.right() - GUTTER_PAD / 2.0, y),
                             egui::Align2::RIGHT_TOP,
@@ -1626,13 +2286,59 @@ impl App {
                             color,
                         );
                     }
-                    line_start = row.ends_with_newline;
-                    if row.ends_with_newline {
-                        line_no += 1;
-                    }
                 }
             }
+            changed
+        })
+        .inner;
+        if changed {
+            // 版を上げ、保存済みの内容と比べて変更あり (dirty) を更新する。
+            // キャッシュは版で判定するので、次の描画で作り直される
+            d.rev += 1;
+            d.update_dirty();
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+/// 置換できなかった理由の説明
+fn replace_error_message(e: &search::ReplaceError) -> String {
+    match e {
+        search::ReplaceError::TooLarge => format!(
+            "置換後のサイズが上限 ({} MiB) を超えるため、置換できません。
+(文書は変更されていません)",
+            search::MAX_REPLACE_RESULT / (1024 * 1024)
+        ),
+        search::ReplaceError::OutOfMemory => {
+            "メモリが足りないため、置換できません。
+(文書は変更されていません)".to_string()
+        }
+    }
+}
+
+/// galley の各表示行の論理行番号。galley が変わったときだけ作り直す
+fn row_lines_for<'a>(cache: &'a mut Option<RowLines>, galley: &Arc<egui::Galley>) -> &'a [u32] {
+    let fresh = matches!(cache, Some(c) if Arc::ptr_eq(&c.galley, galley));
+    if !fresh {
+        *cache = Some(RowLines {
+            galley: galley.clone(),
+            lines: row_line_numbers(galley.rows.iter().map(|r| r.ends_with_newline)),
         });
+    }
+    cache.as_ref().map_or(&[], |c| c.lines.as_slice())
+}
+
+/// 入力された文字列・貼り付けた文字列の改行を LF に統一する。
+///
+/// egui-winit は貼り付けの CRLF だけを LF にするため、単独の CR (古い Mac 形式など) が
+/// 本文に入り込むことがある。本文の内部表現は LF だけなので、入り口で揃える
+fn normalize_text_events(events: &mut [egui::Event]) {
+    for e in events {
+        if let egui::Event::Text(s) | egui::Event::Paste(s) = e {
+            if s.contains('\r') {
+                *s = encoding::normalize_eol(std::mem::take(s));
+            }
+        }
     }
 }
 
@@ -1654,21 +2360,33 @@ impl eframe::App for App {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         let time = raw_input.time.unwrap_or(0.0);
         self.ime_guard.filter(time, &mut raw_input.events);
+        normalize_text_events(&mut raw_input.events);
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let hwnd = match frame.window_handle().map(|h| h.as_raw()) {
+            Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+            _ => 0,
+        };
+        self.update_ui(ctx, hwnd);
+    }
+}
+
+impl App {
+    /// 1 フレーム分の画面の更新。`hwnd` は IME の文節の取得に使うウィンドウハンドル
+    /// (取得できなければ 0)。eframe に依存しないので、テストから直接呼べる
+    fn update_ui(&mut self, ctx: &egui::Context, hwnd: isize) {
         // 変換中は IME から文節 (どれが変換対象か) を取得する。失敗時は空 (全体表示)
         if self.ime_guard.composing {
-            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            let hwnd = match frame.window_handle().map(|h| h.as_raw()) {
-                Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
-                _ => 0,
-            };
             self.ime_guard.segs = ime::query(hwnd, &self.ime_guard.preedit);
         } else if !self.ime_guard.segs.is_empty() {
             self.ime_guard.segs.clear();
         }
         let mut acts = Vec::new();
+
+        // バックグラウンドの読み込みが終わっていれば取り込む
+        self.poll_loads(ctx);
 
         // ウィンドウへのドラッグ&ドロップで開く
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -1682,19 +2400,18 @@ impl eframe::App for App {
             self.open_path(p);
         }
 
-        // 未保存の文書がある状態でウィンドウを閉じようとしたら確認
-        if ctx.input(|i| i.viewport().close_requested())
-            && !self.allow_exit
-            && self.docs.iter().any(|d| d.dirty)
-        {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            self.modal = Some(Modal::ConfirmExit);
-        }
+        // ウィンドウを閉じる要求。未保存の文書があるかの判断は、この描画の編集欄の処理が
+        // 終わった後で行う (同じ描画で最初の入力と閉じる要求が届くと、入力による変更ありへの
+        // 切り替えが画面の処理の途中になり、ここで判断すると見逃してしまうため)
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
 
         let enabled = self.modal.is_none();
         if enabled {
             self.shortcuts(ctx, &mut acts);
         }
+
+        // 文字数・行数 (版が変わったときだけ数え直す)
+        self.docs[self.active].stats();
 
         // ウィンドウタイトル
         let d = &self.docs[self.active];
@@ -1726,6 +2443,13 @@ impl eframe::App for App {
             ui.add_enabled_ui(enabled, |ui| self.editor(ui));
         });
 
+        // 編集欄の処理が終わったので、未保存の文書があるか確かめる。あれば閉じるのを取り消して確認する
+        // (なければ、閉じる要求をそのまま通す)
+        if close_requested && !self.allow_exit && self.docs.iter().any(|d| d.dirty) {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.modal = Some(Modal::ConfirmExit);
+        }
+
         if let Some(m) = self.modal.clone() {
             self.show_modal(ctx, m, &mut acts);
         }
@@ -1734,9 +2458,7 @@ impl eframe::App for App {
             self.run(ctx, a);
         }
     }
-}
 
-impl App {
     fn show_modal(&self, ctx: &egui::Context, m: Modal, acts: &mut Vec<Action>) {
         let win = |title: &str| {
             egui::Window::new(title.to_owned())
@@ -1784,20 +2506,142 @@ impl App {
                     });
                 });
             }
-            Modal::Lossy { id, path } => {
+            Modal::Lossy {
+                id,
+                path,
+                then,
+                ok,
+                examples,
+            } => {
                 let enc = self
                     .index_of(id)
                     .map(|i| self.docs[i].enc.label())
                     .unwrap_or_default();
                 win("文字コードの警告").show(ctx, |ui| {
                     ui.label(format!(
-                        "{} では表現できない文字が含まれています。\nそのまま保存すると、それらの文字は「&#数値;」形式に置き換えられます。",
+                        "{} では正しく保存できない文字が含まれています。\n\
+                         そのまま保存すると、表現できない文字は「&#数値;」形式に、\n\
+                         別の文字と同じ符号になる文字 (例: ¥ → \\) はその文字に変わります。",
                         enc
                     ));
+                    if !examples.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(format!("変わる文字の例: {}", examples.join("、")));
+                    }
+                    ui.label("保存すると、画面の文字も保存した内容に置き換わります (Ctrl+Z で戻せます)。");
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("それでも保存").clicked() {
-                            acts.push(Action::ForceWrite(id, path.clone()));
+                            acts.push(Action::SaveConfirmed {
+                                id,
+                                path: path.clone(),
+                                then,
+                                ok: Confirmed { lossy: true, ..ok },
+                            });
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            acts.push(Action::DismissModal);
+                        }
+                    });
+                });
+            }
+            Modal::LossyLoad {
+                id,
+                path,
+                then,
+                ok,
+            } => {
+                win("上書き保存の確認").show(ctx, |ui| {
+                    ui.label(
+                        "このファイルには、文字コードとして読めないバイトが含まれていました。\n\
+                         上書き保存すると、その元のバイトは失われ、別の文字 (U+FFFD) に置き換わります。",
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("保存").clicked() {
+                            acts.push(Action::SaveConfirmed {
+                                id,
+                                path: path.clone(),
+                                then,
+                                ok: Confirmed {
+                                    lossy_load: true,
+                                    ..ok
+                                },
+                            });
+                        }
+                        if ui.button("名前を付けて保存").clicked() {
+                            acts.push(Action::SaveAsFor(id, then));
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            acts.push(Action::DismissModal);
+                        }
+                    });
+                });
+            }
+            Modal::Conflict {
+                id,
+                path,
+                then,
+                ok,
+            } => {
+                win("ファイルが変更されています").show(ctx, |ui| {
+                    ui.label(format!(
+                        "このファイルは、開いた後に他のプログラムで変更または削除されています:\n{}\n\n\
+                         上書きすると、その変更は失われます。",
+                        path.display()
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("上書きする").clicked() {
+                            acts.push(Action::SaveConfirmed {
+                                id,
+                                path: path.clone(),
+                                then,
+                                ok: Confirmed {
+                                    conflict: true,
+                                    ..ok
+                                },
+                            });
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            acts.push(Action::DismissModal);
+                        }
+                    });
+                });
+            }
+            Modal::ConfirmReload { id, enc } => {
+                let name = self
+                    .index_of(id)
+                    .map(|i| self.docs[i].title())
+                    .unwrap_or_default();
+                win("確認").show(ctx, |ui| {
+                    ui.label(format!(
+                        "「{}」の未保存の編集は破棄されます。\n{} でディスクから読み直しますか?",
+                        name,
+                        enc.label()
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("破棄して読み直す").clicked() {
+                            acts.push(Action::ReloadNow(id, enc));
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            acts.push(Action::DismissModal);
+                        }
+                    });
+                });
+            }
+            Modal::ConfirmLargeOpen { path, size } => {
+                win("大きなファイル").show(ctx, |ui| {
+                    ui.label(format!(
+                        "{}\nのサイズは約 {} MB です。開くのに時間とメモリがかかります。\n開きますか?",
+                        path.display(),
+                        size / (1024 * 1024)
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("開く").clicked() {
+                            acts.push(Action::OpenAnyway(path.clone()));
                         }
                         if ui.button("キャンセル").clicked() {
                             acts.push(Action::DismissModal);
@@ -1990,7 +2834,7 @@ mod undo_tests {
         h.type_text("X");
         let typed = h.text.clone();
         h.focus(field()); // 置換バーへ移動 (入力の直後、1 秒以内)
-        let new_text = search::replace_all(&h.text, "abc", "Z", true).0;
+        let new_text = search::replace_all(&h.text, "abc", "Z", true).unwrap().0;
         replace_text_with_undo(&h.ctx, ed(), &mut h.text, new_text, (0, 0));
         assert_eq!(h.text, typed.replace("abc", "Z"));
         h.focus(ed()); // アプリは置換後に編集欄へフォーカスを戻す
@@ -2426,5 +3270,710 @@ mod undo_tests {
             preedit_rects(&galley, (4, 5)).is_empty(),
             "改行だけは描かない"
         );
+    }
+}
+
+/// アプリ全体の動き (開く・保存・閉じる) を、画面を出さずに確かめるテスト
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// テストごとの作業フォルダ (終わると削除)
+    struct Tmp(PathBuf);
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    impl Tmp {
+        fn new() -> Self {
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let d =
+                std::env::temp_dir().join(format!("rs_editor_app_{}_{}", std::process::id(), n));
+            std::fs::create_dir_all(&d).unwrap();
+            Tmp(d)
+        }
+        fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let p = self.0.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn app() -> App {
+        App::blank(egui::Context::default())
+    }
+
+    /// バックグラウンドの読み込みがすべて終わるまで待つ
+    fn wait_loads(app: &mut App) {
+        let ctx = app.ctx.clone();
+        for _ in 0..1000 {
+            app.poll_loads(&ctx);
+            if app.loads.is_empty() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("読み込みが終わらない");
+    }
+
+    fn open(app: &mut App, p: &Path) {
+        app.open_path(p.to_path_buf());
+        wait_loads(app);
+    }
+
+    /// 文書を編集した状態にする (編集欄の変更と同じ手順)
+    fn edit(app: &mut App, idx: usize, f: impl FnOnce(&mut String)) {
+        let d = &mut app.docs[idx];
+        f(&mut d.text);
+        d.rev += 1;
+        d.update_dirty();
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        app: &mut App,
+        t: &mut f64,
+        events: Vec<egui::Event>,
+        close: bool,
+    ) -> egui::FullOutput {
+        *t += 0.05;
+        let mut raw = egui::RawInput {
+            time: Some(*t),
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        if close {
+            raw.viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .events
+                .push(egui::ViewportEvent::Close);
+        }
+        ctx.run(raw, |ctx| app.update_ui(ctx, 0))
+    }
+
+    fn cancels_close(out: &egui::FullOutput) -> bool {
+        out.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|v| {
+                v.commands
+                    .iter()
+                    .any(|c| matches!(c, ViewportCommand::CancelClose))
+            })
+    }
+
+    /// 現在の確認の画面で「保存する側」の答えを選んで実行する
+    fn confirm(app: &mut App) {
+        let ctx = app.ctx.clone();
+        let act = match app.modal.clone() {
+            Some(Modal::Lossy {
+                id,
+                path,
+                then,
+                ok,
+                ..
+            }) => Action::SaveConfirmed {
+                id,
+                path,
+                then,
+                ok: Confirmed { lossy: true, ..ok },
+            },
+            Some(Modal::LossyLoad {
+                id,
+                path,
+                then,
+                ok,
+            }) => Action::SaveConfirmed {
+                id,
+                path,
+                then,
+                ok: Confirmed {
+                    lossy_load: true,
+                    ..ok
+                },
+            },
+            Some(Modal::Conflict {
+                id,
+                path,
+                then,
+                ok,
+            }) => Action::SaveConfirmed {
+                id,
+                path,
+                then,
+                ok: Confirmed {
+                    conflict: true,
+                    ..ok
+                },
+            },
+            _ => panic!("確認の画面ではない"),
+        };
+        app.run(&ctx, act);
+    }
+
+    /// 同じファイルを開き直しても、新しいタブは増えず、既存のタブに切り替わる
+    #[test]
+    fn opening_same_file_activates_existing_tab() {
+        let t = Tmp::new();
+        let a = t.file("a.txt", b"aaa");
+        let b = t.file("b.txt", b"bbb");
+        let mut app = app();
+        // 読み込み中に同じファイルを 2 回頼んでも、読み込みは 1 つだけ
+        app.open_path(a.clone());
+        app.open_path(a.clone());
+        assert_eq!(app.loads.len(), 1);
+        wait_loads(&mut app);
+        open(&mut app, &b);
+        assert_eq!(app.docs.len(), 2);
+        assert_eq!(app.active, 1);
+        // 別の書き方 (./ を挟む、大文字小文字違い) でも同じファイル
+        open(&mut app, &t.0.join(".").join("a.txt"));
+        assert_eq!(app.docs.len(), 2);
+        assert_eq!(app.active, 0);
+        if cfg!(windows) {
+            app.active = 1;
+            open(&mut app, &t.0.join("A.TXT"));
+            assert_eq!(app.docs.len(), 2);
+            assert_eq!(app.active, 0);
+        }
+    }
+
+    /// 開けなかったファイルは、エラーを表示する (タブは増えない)
+    #[test]
+    fn open_failure_shows_error() {
+        let t = Tmp::new();
+        let mut app = app();
+        open(&mut app, &t.0.join("none.txt"));
+        assert!(matches!(app.modal, Some(Modal::Info(_))));
+        assert_eq!(app.docs.len(), 1);
+        assert!(app.docs[0].path.is_none());
+        // UTF-32 は未対応として開かない
+        let u32p = t.file("u32.txt", &[0xFF, 0xFE, 0, 0, b'a', 0, 0, 0]);
+        app.modal = None;
+        open(&mut app, &u32p);
+        assert!(matches!(&app.modal, Some(Modal::Info(m)) if m.contains("UTF-32")));
+        assert!(app.docs[0].path.is_none());
+    }
+
+    /// 大きなファイルは、読み込む前に確認する
+    #[test]
+    fn large_file_asks_before_loading() {
+        let t = Tmp::new();
+        let p = t.0.join("big.bin");
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(fileio::LARGE_FILE_BYTES + 1).unwrap();
+        drop(f);
+        let mut app = app();
+        app.open_path(p);
+        assert!(matches!(app.modal, Some(Modal::ConfirmLargeOpen { .. })));
+        assert!(app.loads.is_empty());
+    }
+
+    /// 変更のない文書の上書き保存は何も書かない (デコードできなかったバイト・混在した改行を保つ)
+    #[test]
+    fn unmodified_save_writes_nothing() {
+        let t = Tmp::new();
+        let bad = [
+            0xEF, 0xBB, 0xBF, b'a', 0xFF, b'b', b'\r', b'\n', b'c', b'\n', b'd', b'\r',
+        ];
+        let p = t.file("bad.txt", &bad);
+        let mut app = app();
+        open(&mut app, &p);
+        assert!(app.docs[0].lossy_load);
+        assert!(app.status.contains("デコード"));
+        assert!(app.status.contains("混在"), "{}", app.status);
+        assert!(app.status.contains("CRLF"));
+        let ctx = app.ctx.clone();
+        app.run(&ctx, Action::Save);
+        assert!(app.status.contains("変更はありません"));
+        assert!(app.modal.is_none());
+        assert_eq!(std::fs::read(&p).unwrap(), bad);
+    }
+
+    /// 読み込み時にデコードできなかったバイトがあるファイルへの上書きは、確認する
+    #[test]
+    fn lossy_load_overwrite_asks_first() {
+        let t = Tmp::new();
+        let bad = [0xEF, 0xBB, 0xBF, b'a', 0xFF, b'b'];
+        let p = t.file("bad.txt", &bad);
+        let mut app = app();
+        open(&mut app, &p);
+        let ctx = app.ctx.clone();
+        app.run(&ctx, Action::SetEol(Eol::Lf));
+        assert!(app.docs[0].dirty);
+        app.run(&ctx, Action::Save);
+        assert!(matches!(app.modal, Some(Modal::LossyLoad { .. })));
+        assert_eq!(std::fs::read(&p).unwrap(), bad, "確認の前には書かない");
+        confirm(&mut app);
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            [0xEF, 0xBB, 0xBF, b'a', 0xEF, 0xBF, 0xBD, b'b']
+        );
+        assert!(!app.docs[0].lossy_load);
+        assert!(!app.docs[0].dirty);
+        assert!(app.modal.is_none());
+    }
+
+    /// 別の名前への保存は、元のバイトを壊さないので確認しない
+    #[test]
+    fn lossy_load_save_as_other_path_needs_no_confirmation() {
+        let t = Tmp::new();
+        let p = t.file("bad.txt", &[0xEF, 0xBB, 0xBF, b'a', 0xFF, b'b']);
+        let mut app = app();
+        open(&mut app, &p);
+        let ctx = app.ctx.clone();
+        let other = t.0.join("other.txt");
+        assert!(app.write_doc(&ctx, 0, other.clone(), Then::None, Confirmed::default()));
+        assert!(other.exists());
+        assert_eq!(std::fs::read(&p).unwrap(), [0xEF, 0xBB, 0xBF, b'a', 0xFF, b'b']);
+    }
+
+    /// 開いた後に外部で変更されたファイルへの上書きは確認し、確認後は閉じる操作も再開する
+    #[test]
+    fn external_change_asks_and_resumes_close() {
+        let t = Tmp::new();
+        let p = t.file("f.txt", b"one");
+        let mut app = app();
+        open(&mut app, &p);
+        std::fs::write(&p, b"changed elsewhere").unwrap();
+        edit(&mut app, 0, |s| s.push_str("-mine"));
+        let ctx = app.ctx.clone();
+        let id = app.docs[0].id;
+        app.run(&ctx, Action::SaveAndClose(id));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Conflict {
+                then: Then::Close(_),
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(&p).unwrap(), b"changed elsewhere");
+        confirm(&mut app);
+        assert_eq!(std::fs::read(&p).unwrap(), b"one-mine");
+        assert!(app.docs.iter().all(|d| d.id != id), "保存して閉じた");
+    }
+
+    /// 開いた後に削除されたファイルへの保存も、確認する
+    #[test]
+    fn deleted_file_asks_before_save() {
+        let t = Tmp::new();
+        let p = t.file("f.txt", b"one");
+        let mut app = app();
+        open(&mut app, &p);
+        std::fs::remove_file(&p).unwrap();
+        edit(&mut app, 0, |s| s.push('x'));
+        let ctx = app.ctx.clone();
+        app.run(&ctx, Action::Save);
+        assert!(matches!(app.modal, Some(Modal::Conflict { .. })));
+        assert!(!p.exists());
+        confirm(&mut app);
+        assert!(p.exists());
+        assert!(!app.docs[0].dirty);
+    }
+
+    /// 「すべて保存して終了」は、競合の確認で止まり、確認後に続きを行って終了する
+    #[test]
+    fn save_all_and_exit_stops_at_conflict_then_continues() {
+        let t = Tmp::new();
+        let a = t.file("a.txt", b"a");
+        let b = t.file("b.txt", b"b");
+        let mut app = app();
+        open(&mut app, &a);
+        open(&mut app, &b);
+        std::fs::write(&a, b"external").unwrap();
+        edit(&mut app, 0, |s| s.push('1'));
+        edit(&mut app, 1, |s| s.push('2'));
+        let ctx = app.ctx.clone();
+        app.run(&ctx, Action::SaveAllAndExit);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Conflict {
+                then: Then::SaveAll,
+                ..
+            })
+        ));
+        assert!(!app.allow_exit);
+        assert_eq!(std::fs::read(&a).unwrap(), b"external");
+        confirm(&mut app);
+        assert!(app.modal.is_none());
+        assert!(app.allow_exit, "確認の後に続きを行い、終了できる");
+        assert!(app.docs.iter().all(|d| !d.dirty));
+        assert_eq!(std::fs::read(&a).unwrap(), b"a1");
+        assert_eq!(std::fs::read(&b).unwrap(), b"b2");
+    }
+
+    /// 別のタブで開いているファイルへは保存できない
+    #[test]
+    fn save_to_file_open_in_other_tab_is_refused() {
+        let t = Tmp::new();
+        let a = t.file("a.txt", b"a");
+        let b = t.file("b.txt", b"b");
+        let mut app = app();
+        open(&mut app, &a);
+        open(&mut app, &b);
+        edit(&mut app, 1, |s| s.push('!'));
+        let ctx = app.ctx.clone();
+        assert!(!app.write_doc(&ctx, 1, a.clone(), Then::None, Confirmed::default()));
+        assert!(
+            matches!(&app.modal, Some(Modal::Info(m)) if m.contains("別のタブで開いています"))
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), b"a");
+        assert!(app.docs[1].dirty);
+    }
+
+    /// 書き込みに失敗したら、エラーを表示して変更ありのまま (元のファイルも無事)
+    #[test]
+    fn write_failure_keeps_dirty_and_original() {
+        let t = Tmp::new();
+        let p = t.file("f.txt", b"orig");
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&p, perm.clone()).unwrap();
+        let mut app = app();
+        open(&mut app, &p);
+        edit(&mut app, 0, |s| s.push('x'));
+        let ctx = app.ctx.clone();
+        app.run(&ctx, Action::Save);
+        assert!(matches!(&app.modal, Some(Modal::Info(m)) if m.contains("保存に失敗")));
+        assert!(app.docs[0].dirty);
+        assert_eq!(std::fs::read(&p).unwrap(), b"orig");
+        perm.set_readonly(false);
+        std::fs::set_permissions(&p, perm).unwrap();
+    }
+
+    /// Shift_JIS で別の文字になる文字 (¥) は警告し、保存後は画面の文字を保存内容にそろえる。
+    /// 保存して閉じる操作も、確認の後に再開する
+    #[test]
+    fn lossy_save_warns_syncs_text_and_resumes() {
+        let t = Tmp::new();
+        let sjis = Enc::Legacy(encoding_rs::SHIFT_JIS);
+        for close in [false, true] {
+            let p = t.0.join(format!("sjis{close}.txt"));
+            let mut app = app();
+            let ctx = app.ctx.clone();
+            let id = app.docs[0].id;
+            app.docs[0].path = Some(p.clone());
+            app.docs[0].enc = sjis;
+            app.docs[0].eol = Eol::Lf;
+            edit(&mut app, 0, |s| s.push_str("a\u{a5}b"));
+            app.run(
+                &ctx,
+                if close {
+                    Action::SaveAndClose(id)
+                } else {
+                    Action::Save
+                },
+            );
+            match &app.modal {
+                Some(Modal::Lossy { examples, then, .. }) => {
+                    assert_eq!(examples, &vec!["\u{a5} → \\".to_string()]);
+                    assert_eq!(*then == Then::Close(id), close);
+                }
+                m => panic!("警告が出ない: {}", m.is_some()),
+            }
+            assert!(!p.exists(), "確認の前には書かない");
+            confirm(&mut app);
+            assert_eq!(std::fs::read(&p).unwrap(), [b'a', 0x5C, b'b']);
+            if close {
+                assert!(app.docs.iter().all(|d| d.id != id), "保存して閉じる");
+            } else {
+                assert_eq!(app.docs[0].text, "a\\b", "画面の文字も保存内容に");
+                assert!(!app.docs[0].dirty);
+                // Ctrl+Z で ¥ に戻せるよう、履歴に積んである
+                let state = TextEditState::load(&ctx, editor_id(id)).unwrap();
+                let mut u = state.undoer();
+                let cur = (CCursorRange::default(), app.docs[0].text.clone());
+                assert!(u.undo(&cur).is_some_and(|(_, s)| s == "a\u{a5}b"));
+            }
+        }
+    }
+
+    /// 文字コードを指定した読み直し: 未保存の編集があれば確認し、ディスクから読み直す
+    #[test]
+    fn reload_confirms_when_dirty_and_rereads_disk() {
+        let t = Tmp::new();
+        let p = t.file("f.txt", b"disk v1");
+        let mut app = app();
+        open(&mut app, &p);
+        edit(&mut app, 0, |s| s.push_str(" + edit"));
+        let ctx = app.ctx.clone();
+        app.run(&ctx, Action::Reload(Enc::Utf8));
+        assert!(matches!(app.modal, Some(Modal::ConfirmReload { .. })));
+        assert!(app.docs[0].dirty);
+        assert!(app.loads.is_empty());
+        // ディスクのファイルが変わっていたら、それを読む (メモリ上の古いバイトではなく)
+        std::fs::write(&p, b"disk v2").unwrap();
+        let id = app.docs[0].id;
+        app.run(&ctx, Action::ReloadNow(id, Enc::Utf8));
+        wait_loads(&mut app);
+        assert_eq!(app.docs[0].text, "disk v2");
+        assert!(!app.docs[0].dirty);
+        // 読み直した後は、その状態が保存済みの基準になり、競合も起きない
+        edit(&mut app, 0, |s| s.push('!'));
+        app.run(&ctx, Action::Save);
+        assert!(app.modal.is_none(), "{:?}", app.status);
+        assert_eq!(std::fs::read(&p).unwrap(), b"disk v2!");
+    }
+
+    /// 読み直しに失敗したら、エラーを表示して文書はそのまま
+    #[test]
+    fn reload_failure_keeps_document() {
+        let t = Tmp::new();
+        let p = t.file("f.txt", b"abc");
+        let mut app = app();
+        open(&mut app, &p);
+        std::fs::remove_file(&p).unwrap();
+        let ctx = app.ctx.clone();
+        app.run(&ctx, Action::Reload(Enc::Utf8));
+        wait_loads(&mut app);
+        assert!(matches!(app.modal, Some(Modal::Info(_))));
+        assert_eq!(app.docs[0].text, "abc");
+    }
+
+    /// 読み直しで Undo 履歴が初期化される (読み直す前の履歴で別の内容に戻らない)
+    #[test]
+    fn reset_editor_state_clears_undo() {
+        let ctx = egui::Context::default();
+        let id = editor_id(7);
+        let mut text = "abc".to_string();
+        assert!(replace_text_with_undo(
+            &ctx,
+            id,
+            &mut text,
+            "xyz".into(),
+            (0, 0)
+        ));
+        reset_editor_state(&ctx, id);
+        let mut u = TextEditState::load(&ctx, id).unwrap().undoer();
+        assert!(u.undo(&(CCursorRange::default(), text)).is_none());
+    }
+
+    /// 閉じる要求と最初の入力が同じ描画に届いても、未保存として確認する
+    #[test]
+    fn close_in_same_frame_as_first_edit_is_confirmed() {
+        let ctx = egui::Context::default();
+        let mut app = App::blank(ctx.clone());
+        let mut t = 0.0;
+        frame(&ctx, &mut app, &mut t, vec![], false);
+        frame(&ctx, &mut app, &mut t, vec![], false);
+        assert!(!app.docs[0].dirty);
+        let out = frame(
+            &ctx,
+            &mut app,
+            &mut t,
+            vec![egui::Event::Text("x".into())],
+            true,
+        );
+        assert_eq!(app.docs[0].text, "x");
+        assert!(app.docs[0].dirty);
+        assert!(cancels_close(&out), "閉じるのを取り消す");
+        assert!(matches!(app.modal, Some(Modal::ConfirmExit)));
+    }
+
+    /// 未保存の文書がなければ、閉じる要求は取り消さない
+    #[test]
+    fn close_without_changes_is_not_cancelled() {
+        let ctx = egui::Context::default();
+        let mut app = App::blank(ctx.clone());
+        let mut t = 0.0;
+        frame(&ctx, &mut app, &mut t, vec![], false);
+        let out = frame(&ctx, &mut app, &mut t, vec![], true);
+        assert!(!cancels_close(&out));
+        assert!(app.modal.is_none());
+    }
+
+    /// 元の内容に戻したら、変更ありは解除される (Undo・改行コードの往復)
+    #[test]
+    fn dirty_clears_when_content_returns_to_saved() {
+        let mut d = Doc::blank(1, 1);
+        d.text = "hello".into();
+        d.mark_saved();
+        d.text.push('!');
+        d.update_dirty();
+        assert!(d.dirty);
+        d.text.pop();
+        d.update_dirty();
+        assert!(!d.dirty, "Undo で保存時の内容に戻った");
+        // 同じ長さで中身が違う
+        d.text = "hellp".into();
+        d.update_dirty();
+        assert!(d.dirty);
+        d.text = "hello".into();
+        d.eol = Eol::Lf;
+        d.update_dirty();
+        assert!(d.dirty);
+        d.eol = Eol::CrLf; // 初期値は CRLF
+        d.update_dirty();
+        assert!(!d.dirty, "CRLF → LF → CRLF で元に戻った");
+        d.enc = Enc::Utf8Bom;
+        d.update_dirty();
+        assert!(d.dirty);
+        d.enc = Enc::Utf8;
+        d.update_dirty();
+        assert!(!d.dirty);
+    }
+
+    /// 大きな文書は完全な比較をせず、編集したら変更ありのまま
+    #[test]
+    fn huge_documents_stay_dirty() {
+        let mut d = Doc::blank(1, 1);
+        d.text = "a".repeat(EXACT_DIRTY_LIMIT + 1);
+        d.mark_saved();
+        assert!(!d.saved.exact);
+        d.update_dirty();
+        assert!(d.dirty);
+    }
+
+    /// 文字数・行数は版が変わったときだけ数え直す
+    #[test]
+    fn stats_cached_per_revision() {
+        let mut d = Doc::blank(1, 1);
+        d.text = "あい\nう\n".into();
+        assert_eq!(d.stats(), (5, 3));
+        d.text.push_str("えお"); // 版を上げていないので、まだ古い値
+        assert_eq!(d.stats(), (5, 3));
+        d.rev += 1;
+        assert_eq!(d.stats(), (7, 3));
+    }
+
+    /// 行番号用: 折り返した表示行も、論理行の番号を持つ
+    #[test]
+    fn row_line_numbers_follow_logical_lines() {
+        assert_eq!(
+            row_line_numbers([false, true, true, false, false, true].into_iter()),
+            vec![1, 1, 2, 3, 3, 3]
+        );
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let font = egui::FontId::monospace(14.0);
+        let galley = ctx.fonts(|f| {
+            f.layout(
+                "aaaa bbbb cccc\nd\n\ne".into(),
+                font,
+                egui::Color32::WHITE,
+                30.0, // 狭くして折り返させる
+            )
+        });
+        let lines = row_line_numbers(galley.rows.iter().map(|r| r.ends_with_newline));
+        assert!(galley.rows.len() > 4, "折り返している");
+        assert_eq!(*lines.first().unwrap(), 1);
+        assert_eq!(*lines.last().unwrap(), 4);
+        // 見える範囲の先頭行を二分探索で求める
+        let y0 = 100.0;
+        assert_eq!(first_visible_row(&galley, y0, 0.0), 0);
+        let second = &galley.rows[1].rect;
+        let top = y0 + (second.min.y + second.max.y) / 2.0;
+        assert_eq!(first_visible_row(&galley, y0, top), 1);
+        assert_eq!(first_visible_row(&galley, y0, 1.0e6), galley.rows.len());
+        // 同じ galley (Arc) なら作り直さない
+        let mut cache = None;
+        let p1 = row_lines_for(&mut cache, &galley).as_ptr();
+        let p2 = row_lines_for(&mut cache, &galley).as_ptr();
+        assert_eq!(p1, p2);
+    }
+
+    /// 貼り付け・入力の改行は LF にそろえる (単独の CR が本文に入らない)
+    #[test]
+    fn pasted_and_typed_text_newlines_are_normalized() {
+        let mut evs = vec![
+            egui::Event::Paste("a\r\nb\rc\nd".into()),
+            egui::Event::Text("x\ry".into()),
+            egui::Event::Text("plain".into()),
+        ];
+        normalize_text_events(&mut evs);
+        assert_eq!(evs[0], egui::Event::Paste("a\nb\nc\nd".into()));
+        assert_eq!(evs[1], egui::Event::Text("x\ny".into()));
+        assert_eq!(evs[2], egui::Event::Text("plain".into()));
+    }
+
+    /// 確定の Enter を取り除くのは 1 回だけ。猶予の間でも、続けて来た Enter は本物の改行にする
+    #[test]
+    fn ime_guard_drops_only_one_enter_after_commit() {
+        let mut g = ImeGuard::default();
+        let ev = |e| egui::Event::Ime(e);
+        let enter = || egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        g.filter(
+            0.0,
+            &mut vec![
+                ev(egui::ImeEvent::Enabled),
+                ev(egui::ImeEvent::Preedit("あ".into())),
+            ],
+        );
+        let mut evs = vec![ev(egui::ImeEvent::Commit("あ".into())), enter(), enter()];
+        g.filter(0.01, &mut evs);
+        let enters = evs
+            .iter()
+            .filter(|e| matches!(e, egui::Event::Key { .. }))
+            .count();
+        assert_eq!(enters, 1, "1 回目だけ取り除く");
+        // 次のフレームでも (猶予の間に) 来た Enter は通る
+        let mut evs = vec![enter()];
+        g.filter(0.02, &mut evs);
+        assert_eq!(evs.len(), 1);
+        // 新しい確定のたびに、また 1 回取り除ける
+        g.filter(1.0, &mut vec![ev(egui::ImeEvent::Preedit("い".into()))]);
+        let mut evs = vec![ev(egui::ImeEvent::Commit("い".into()))];
+        g.filter(1.01, &mut evs);
+        let mut evs = vec![enter()];
+        g.filter(1.02, &mut evs);
+        assert!(evs.is_empty());
+    }
+
+    /// タブの列は、選択が変わったときだけ選択中のタブへスクロールする
+    #[test]
+    fn tab_bar_scroll_target_follows_selection() {
+        let ctx = egui::Context::default();
+        let mut app = App::blank(ctx.clone());
+        for _ in 0..30 {
+            app.new_doc();
+        }
+        let mut t = 0.0;
+        frame(&ctx, &mut app, &mut t, vec![], false);
+        assert_eq!(app.tab_shown, Some(app.docs[app.active].id));
+        app.active = 0;
+        frame(&ctx, &mut app, &mut t, vec![], false);
+        assert_eq!(app.tab_shown, Some(app.docs[0].id));
+    }
+
+    /// 検索の強調付きでも描画でき、本文が変わらない間は表示 (galley) を使い回す。
+    /// 本文が変わると作り直す。検索バー (折り返し付き) を開いたままの描画も確かめる
+    #[test]
+    fn layout_is_cached_until_text_changes() {
+        let ctx = egui::Context::default();
+        let mut app = App::blank(ctx.clone());
+        app.docs[0].text = "abc abc
+xyz abc".into();
+        app.docs[0].rev = 1;
+        app.find.open = true;
+        app.find.show_replace = true;
+        app.find.query = "abc".into();
+        let mut t = 0.0;
+        frame(&ctx, &mut app, &mut t, vec![], false);
+        frame(&ctx, &mut app, &mut t, vec![], false);
+        let g1 = app.docs[0].layout_cache.as_ref().unwrap().galley.clone();
+        assert_eq!(app.docs[0].matches().len(), 3);
+        frame(&ctx, &mut app, &mut t, vec![], false);
+        let g2 = app.docs[0].layout_cache.as_ref().unwrap().galley.clone();
+        assert!(Arc::ptr_eq(&g1, &g2), "変わらなければ再レイアウトしない");
+        // 入力で本文が変わると、次の描画で作り直される
+        frame(&ctx, &mut app, &mut t, vec![egui::Event::Text("Q".into())], false);
+        frame(&ctx, &mut app, &mut t, vec![], false);
+        let g3 = app.docs[0].layout_cache.as_ref().unwrap().galley.clone();
+        assert!(!Arc::ptr_eq(&g1, &g3));
+        assert!(g3.text().contains('Q'));
+        assert_eq!(app.docs[0].rev, 2);
     }
 }
