@@ -14,12 +14,61 @@ type FileId = (u32, u64);
 
 /// ファイルの「指紋」。読み込み・保存の時点で控えておき、上書きの直前にもう一度取って比べて、
 /// 他のプログラムによる変更を検出する (大きさ + 更新日時 + ファイルの識別子)
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `digest` (内容の要約) は、等しいかの比較には使わない (比較は属性だけ。毎回ファイルを読まない
+/// ため)。置き換えで退避した控えを消してよいかの、最後の確認にだけ使う: 他のプログラムが
+/// 同じ長さの内容で上書きして更新日時まで戻した場合は、属性が一致してしまうため
+#[derive(Clone, Debug)]
 pub struct Fingerprint {
     len: u64,
     modified: Option<SystemTime>,
+    /// 最後に知っていた内容 (ファイルのバイト列) の要約。分からないときは `None`
+    digest: Option<u64>,
     /// 取得できなかった (Windows 以外・開けなかった) ときは `None`
     id: Option<FileId>,
+}
+
+impl PartialEq for Fingerprint {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.modified == other.modified && self.id == other.id
+    }
+}
+impl Eq for Fingerprint {}
+
+/// 内容の要約を、少しずつ (ファイルを読みながら) 計算する。固定の鍵の SipHash なので、
+/// 区切り方によらず同じバイト列からは同じ値になる
+#[derive(Default)]
+struct Digest(std::collections::hash_map::DefaultHasher);
+
+impl Digest {
+    fn update(&mut self, bytes: &[u8]) {
+        use std::hash::Hasher;
+        self.0.write(bytes);
+    }
+    fn finish(&self) -> u64 {
+        use std::hash::Hasher;
+        self.0.finish()
+    }
+}
+
+/// バイト列の要約
+pub fn content_digest(bytes: &[u8]) -> u64 {
+    let mut d = Digest::default();
+    d.update(bytes);
+    d.finish()
+}
+
+/// 開いているファイルの残りを読んで、要約を求める
+fn digest_of_reader(f: &mut impl Read) -> io::Result<u64> {
+    let mut d = Digest::default();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            return Ok(d.finish());
+        }
+        d.update(&buf[..n]);
+    }
 }
 
 #[cfg(windows)]
@@ -52,6 +101,7 @@ impl Fingerprint {
             len: m.len(),
             modified: m.modified().ok(),
             id: file_id(f),
+            digest: None,
         })
     }
 }
@@ -68,6 +118,18 @@ pub fn fingerprint(path: &Path) -> Option<Fingerprint> {
         o.access_mode(0);
     }
     Fingerprint::from_file(&o.open(path).ok()?)
+}
+
+/// 現在のファイルの指紋に、内容の要約を付けたもの。ファイルを最後まで読む。
+/// 利用者が外部の変更を承知するとき (その版を、承知した状態として覚える) に使う。
+/// 読めなかったときは、要約の無い指紋 (退避した控えを消さない側に倒れる)
+pub fn fingerprint_digested(path: &Path) -> Option<Fingerprint> {
+    #[cfg(test)]
+    test_hooks::DIGESTED_READS.with(|c| c.set(c.get() + 1));
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut fp = Fingerprint::from_file(&f)?;
+    fp.digest = digest_of_reader(&mut f).ok();
+    Some(fp)
 }
 
 /// 控えておいた指紋と今のファイルが違うか (削除された・作り直された場合も含む)
@@ -530,7 +592,18 @@ fn backup_matches(backup: &Path, expect: &Expect) -> bool {
     match expect {
         #[cfg(test)]
         Expect::Any => true,
-        Expect::Is(fp) => fp.is_some() && fingerprint(backup) == *fp,
+        // 属性が一致し、さらに内容の要約が (知っていて) 一致するときだけ。同じ長さで
+        // 上書きして更新日時を戻した他のプログラムの版を、見逃して消さないため
+        Expect::Is(Some(fp)) => {
+            let Some(want) = fp.digest else {
+                return false;
+            };
+            fingerprint(backup).as_ref() == Some(fp)
+                && std::fs::File::open(backup)
+                    .and_then(|mut f| digest_of_reader(&mut f))
+                    .is_ok_and(|d| d == want)
+        }
+        Expect::Is(None) => false,
     }
 }
 
@@ -613,6 +686,8 @@ pub mod test_hooks {
     use std::path::Path;
     type Hook = Box<dyn FnOnce(&Path)>;
     thread_local! {
+        /// `fingerprint_digested` (ファイルを最後まで読む) を呼んだ回数
+        pub static DIGESTED_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         static BEFORE: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static AFTER: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
@@ -697,7 +772,14 @@ fn atomic_write_at(
     // 新しい内容を他のユーザーが読めないよう、自分だけが開ける設定で作る
     let mut f = create_temp(temp, existing.is_some()).map_err(failed)?;
     let written = f.write_all(bytes).and_then(|_| f.sync_all());
-    let wrote = written.is_ok().then(|| Fingerprint::from_file(&f)).flatten();
+    let wrote = written
+        .is_ok()
+        .then(|| Fingerprint::from_file(&f))
+        .flatten()
+        .map(|mut w| {
+            w.digest = Some(content_digest(bytes));
+            w
+        });
     drop(f);
     if let Err(e) = written {
         remove_own_temp(temp);
@@ -716,8 +798,13 @@ fn atomic_write_at(
     #[cfg(test)]
     test_hooks::run_before_replace(path);
     let preserved = replace_file(path, temp, backup, existing.is_some(), expect)?;
-    let state = match (wrote, fingerprint(path)) {
-        (Some(w), Some(now)) if w == now => Some(now),
+    // 属性が一致するだけでは、他のプログラムが同じ長さの内容で上書きして更新日時を戻した
+    // 場合と区別できない。保存先の内容を実際に読んで、書いた内容の要約と比べる
+    // (読めない・食い違うときは、確かめられなかったものとして扱う)
+    let state = match (wrote, fingerprint_digested(path)) {
+        (Some(w), Some(now)) if w == now && w.digest.is_some() && w.digest == now.digest => {
+            Some(now)
+        }
         _ => None,
     };
     Ok(match (preserved, state) {
@@ -776,12 +863,16 @@ pub fn load(path: &Path, forced: Option<Enc>) -> Result<Loaded, LoadError> {
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     // 読み込み前の指紋 (読み込み中に変更されたら、次の保存で検出できる)
     let meta = file.metadata().map_err(|e| e.to_string())?;
-    let fp = Fingerprint::from_file(&file);
+    let mut fp = Fingerprint::from_file(&file);
     let mut bytes: Vec<u8> = Vec::new();
     bytes
         .try_reserve_exact(usize::try_from(meta.len()).unwrap_or(usize::MAX))
         .map_err(|_| "メモリが足りないため、ファイルを読み込めません".to_string())?;
     file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    // 読んだ内容の要約 (退避した控えを消してよいかの最後の確認に使う)
+    if let Some(fp) = fp.as_mut() {
+        fp.digest = Some(content_digest(&bytes));
+    }
     if forced.is_none() {
         if let Some(name) = encoding::unsupported_bom(&bytes) {
             return Err(LoadError::Utf32 {
@@ -1129,7 +1220,7 @@ mod tests {
         let w = atomic_write(&p, b"first", &Expect::Is(None)).unwrap();
         assert_eq!(w, Written::Verified(fingerprint(&p).unwrap()));
         // 置き換え (ReplaceFileW を通る)
-        let seen = fingerprint(&p);
+        let seen = fingerprint_digested(&p);
         let w = atomic_write(&p, b"second, longer", &Expect::Is(seen)).unwrap();
         assert_eq!(w, Written::Verified(fingerprint(&p).unwrap()));
         assert_eq!(std::fs::read(&p).unwrap(), b"second, longer");
@@ -1141,11 +1232,30 @@ mod tests {
 
     /// 置き換えの直後に保存先が別の版へ差し替わったら、`Unverified` になる (保存済みとは扱わない)
     #[test]
+    fn same_length_overwrite_right_after_replace_is_unverified() {
+        let d = TempDir::new();
+        let p = d.file("a.txt");
+        std::fs::write(&p, b"original").unwrap();
+        let seen = fingerprint_digested(&p);
+        test_hooks::after_replace(|t| {
+            // 置き換えた一時ファイルの、大きさ・更新日時はそのままで、内容だけ差し替える
+            let mtime = std::fs::metadata(t).unwrap().modified().unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(t).unwrap();
+            (&f).write_all(b"EXT!").unwrap();
+            f.set_modified(mtime).unwrap();
+        });
+        let w = atomic_write(&p, b"mine", &Expect::Is(seen)).unwrap();
+        assert_eq!(w, Written::Unverified);
+        assert_eq!(std::fs::read(&p).unwrap(), b"EXT!");
+    }
+
+    /// 置き換えの直後に保存先が別の版へ差し替わったら、`Unverified` になる (保存済みとは扱わない)
+    #[test]
     fn replaced_target_swapped_right_after_is_unverified() {
         let d = TempDir::new();
         let p = d.file("a.txt");
         std::fs::write(&p, b"original").unwrap();
-        let seen = fingerprint(&p);
+        let seen = fingerprint_digested(&p);
         test_hooks::after_replace(|t| std::fs::write(t, b"synced by someone else").unwrap());
         let w = atomic_write(&p, b"mine", &Expect::Is(seen)).unwrap();
         assert_eq!(w, Written::Unverified);
@@ -1159,7 +1269,7 @@ mod tests {
         let d = TempDir::new();
         let p = d.file("a.txt");
         std::fs::write(&p, b"original").unwrap();
-        let seen = fingerprint(&p);
+        let seen = fingerprint_digested(&p);
         test_hooks::before_replace(|t| std::fs::write(t, b"external version").unwrap());
         let w = atomic_write(&p, b"mine", &Expect::Is(seen)).unwrap();
         let Written::Preserved { backup, fp } = w else {
@@ -1174,7 +1284,7 @@ mod tests {
         assert_eq!(fp, fingerprint(&p), "保存先は書いた内容");
         assert!(d.leftovers().is_empty(), "{:?}", d.leftovers());
         // 2 回目 (同じ秒でも別の名前になる)
-        let seen = fingerprint(&p);
+        let seen = fingerprint_digested(&p);
         test_hooks::before_replace(|t| std::fs::write(t, b"external 2").unwrap());
         let Written::Preserved { backup: b2, .. } =
             atomic_write(&p, b"mine 2", &Expect::Is(seen)).unwrap()
@@ -1184,6 +1294,75 @@ mod tests {
         assert_ne!(b2, backup);
         assert_eq!(std::fs::read(&backup).unwrap(), b"external version");
         assert_eq!(std::fs::read(&b2).unwrap(), b"external 2");
+    }
+
+    /// 他のプログラムが、同じ長さの内容で保存先を上書きして更新日時を元に戻しても
+    /// (大きさ・更新日時・ファイルの識別子は一致する)、その版を控えごと消さずに残す
+    #[test]
+    fn same_length_overwrite_with_restored_mtime_is_preserved() {
+        let d = TempDir::new();
+        let p = d.file("a.txt");
+        std::fs::write(&p, b"original").unwrap();
+        let seen = fingerprint_digested(&p);
+        let mtime = std::fs::metadata(&p).unwrap().modified().unwrap();
+        test_hooks::before_replace(move |t| {
+            // 同じ場所へ、同じ長さの別の内容を書き、更新日時を戻す
+            let f = std::fs::OpenOptions::new().write(true).open(t).unwrap();
+            f.set_len(0).unwrap();
+            (&f).write_all(b"EXTERNAL").unwrap();
+            f.set_modified(mtime).unwrap();
+        });
+        let w = atomic_write(&p, b"mine", &Expect::Is(seen.clone())).unwrap();
+        let Written::Preserved { backup, .. } = w else {
+            panic!("退避されるはず: {w:?}");
+        };
+        assert_eq!(std::fs::read(&backup).unwrap(), b"EXTERNAL");
+        assert_eq!(std::fs::read(&p).unwrap(), b"mine");
+        // 前提の確認: 指紋 (属性) だけでは区別できない版だった
+        assert_eq!(fingerprint(&backup), seen);
+    }
+
+    /// 内容の要約が分からない (承知した状態が属性だけの) ときは、控えを消さずに残す。
+    /// 要約が分かっていて一致するふつうの保存では、控えは残らない
+    #[test]
+    fn backup_is_removed_only_when_digest_is_known_and_matches() {
+        let d = TempDir::new();
+        let p = d.file("a.txt");
+        std::fs::write(&p, b"original").unwrap();
+        // 要約あり: ふつうの保存。控えを残さない
+        let w = atomic_write(&p, b"two", &Expect::Is(fingerprint_digested(&p))).unwrap();
+        let Written::Verified(fp) = w else {
+            panic!("{w:?}");
+        };
+        assert!(d.leftovers().is_empty(), "{:?}", d.leftovers());
+        // 書いた内容の指紋にも要約が付くので、続けて保存しても控えを残さない
+        let w = atomic_write(&p, b"three", &Expect::Is(Some(fp))).unwrap();
+        assert!(matches!(w, Written::Verified(_)), "{w:?}");
+        assert_eq!(std::fs::read(&p).unwrap(), b"three");
+        let n = std::fs::read_dir(&d.0).unwrap().count();
+        assert_eq!(n, 1, "控えは残らない");
+        // 読み込んだ内容の指紋にも要約が付く
+        let loaded = load(&p, None).unwrap();
+        let w = atomic_write(&p, b"four", &Expect::Is(loaded.fingerprint)).unwrap();
+        assert!(matches!(w, Written::Verified(_)), "{w:?}");
+        assert_eq!(std::fs::read_dir(&d.0).unwrap().count(), 1);
+        // 要約なし (不明): 消さずに残す
+        let w = atomic_write(&p, b"five", &Expect::Is(fingerprint(&p))).unwrap();
+        let Written::Preserved { backup, .. } = w else {
+            panic!("{w:?}");
+        };
+        assert_eq!(std::fs::read(&backup).unwrap(), b"four");
+    }
+
+    /// 要約は、読み方 (区切り) によらず、バイト列だけで決まる
+    #[test]
+    fn digest_does_not_depend_on_chunking() {
+        let d = TempDir::new();
+        let p = d.file("big.bin");
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&p, &bytes).unwrap();
+        assert_eq!(fingerprint_digested(&p).unwrap().digest, Some(content_digest(&bytes)));
+        assert_ne!(content_digest(b"abc"), content_digest(b"abd"));
     }
 
     /// 退避の名前は 255 文字に収まる (元の名前を切り詰める)
