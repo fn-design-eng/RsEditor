@@ -412,9 +412,44 @@ fn paint_preedit_for(
         let [a, b] = c.sorted_cursors();
         (a.ccursor.index, b.ccursor.index)
     });
-    if let Some(r) = preedit_range(composing, sel) {
+    let range = preedit_range(composing, sel);
+    if let Some(r) = range {
         paint_preedit(ui, &out.galley, out.galley_pos, r, segs, sel_fill, slot);
     }
+    set_ime_area(ui, out, range, segs);
+}
+
+/// IME の候補ウィンドウを出す位置を、カーソル (変換中は対象の文節の先頭) にする。
+///
+/// egui-winit 0.29 は IME の位置として `IMEOutput::rect` (TextEdit 全体の矩形) を
+/// Windows に渡す。winit はその左上を候補ウィンドウの位置、矩形全体を「避ける範囲」に
+/// するため、本文のような大きな欄では候補ウィンドウが欄の外 (画面の端など) に出てしまう。
+/// そこで `rect` を 1 文字分の高さの細い矩形に置き換える。
+fn set_ime_area(
+    ui: &egui::Ui,
+    out: &egui::text_edit::TextEditOutput,
+    preedit: Option<(usize, usize)>,
+    segs: &[ime::Segment],
+) {
+    let transform = ui
+        .memory(|m| m.layer_transforms.get(&ui.layer_id()).copied())
+        .unwrap_or_default();
+    let area = preedit.map(|(a, _)| {
+        let start = segs
+            .iter()
+            .find(|s| s.kind == ime::Kind::Target)
+            .map_or(a, |s| a + s.range.start);
+        let r = out
+            .galley
+            .pos_from_ccursor(CCursor::new(start))
+            .translate(out.galley_pos.to_vec2());
+        transform * egui::Rect::from_min_size(r.min, egui::vec2(1.0, r.height()))
+    });
+    ui.ctx().output_mut(|o| {
+        if let Some(ime) = &mut o.ime {
+            ime.rect = area.unwrap_or(ime.cursor_rect);
+        }
+    });
 }
 
 /// 1 行の入力欄 (検索・置換) を、変換中の表示付きで出す
@@ -517,13 +552,46 @@ struct ImeGuard {
     segs: Vec<ime::Segment>,
     /// 直近の Commit の時刻 (egui の time)
     last_commit: Option<f64>,
+    /// 最後の (空でない) Preedit の後に来た「空の Preedit / Disabled」の数。
+    /// 最後の Preedit 以降に Commit が来ていれば None
+    ends_since_preedit: Option<u32>,
 }
 
 impl ImeGuard {
     /// 確定の Enter が Commit の前後どちらに来ても取り除くための猶予 (秒)
     const GRACE: f64 = 0.05;
 
+    /// 入力イベントを整える (確定の Enter と、偽の確定を取り除く)。
+    ///
+    /// 偽の確定: winit 0.30 (Windows) は変換の終了 (WM_IME_ENDCOMPOSITION) 時に、IME の
+    /// 確定文字列 (GCS_RESULTSTR) が残っていると、それを Commit として送る。一度候補を
+    /// 出した後は古い確定文字列が残るため、Backspace で未確定文字列をすべて消すと、
+    /// 消したはずの文字が確定として挿入されてしまう。
+    /// 本当の確定では、未確定文字列の後に Disabled が 1 つ来てから Commit が来る。
+    /// 偽の確定では、未確定文字列を消した通知 (空の Preedit か Disabled) がその前に
+    /// もう 1 つ来る。そこで 2 つ以上来た後の Commit は捨て、空の Preedit に置き換える
+    /// (TextEdit に未確定文字列が残っていれば、それを消すため)。
     fn filter(&mut self, time: f64, events: &mut Vec<egui::Event>) {
+        for e in events.iter_mut() {
+            match e {
+                egui::Event::Ime(egui::ImeEvent::Preedit(t)) if !t.is_empty() => {
+                    self.ends_since_preedit = Some(0);
+                }
+                egui::Event::Ime(egui::ImeEvent::Preedit(_) | egui::ImeEvent::Disabled) => {
+                    if let Some(n) = &mut self.ends_since_preedit {
+                        *n += 1;
+                    }
+                }
+                egui::Event::Ime(egui::ImeEvent::Commit(_)) => {
+                    let fake = self.ends_since_preedit.is_some_and(|n| n >= 2);
+                    self.ends_since_preedit = None;
+                    if fake {
+                        *e = egui::Event::Ime(egui::ImeEvent::Preedit(String::new()));
+                    }
+                }
+                _ => {}
+            }
+        }
         events.retain(|e| match e {
             egui::Event::Ime(egui::ImeEvent::Preedit(t)) => {
                 self.composing = !t.is_empty();
@@ -1996,6 +2064,56 @@ mod undo_tests {
             ],
         );
         assert_eq!(h.text, "い");
+    }
+
+    /// Backspace で未確定文字列を消し切ったとき、winit が送る偽の確定 (古い確定文字列) は
+    /// 挿入しない。winit の送り方 (空の Preedit / Disabled の後に Disabled + Commit) を再現する
+    #[test]
+    fn ime_fake_commit_after_backspace_ignored() {
+        use egui::ImeEvent::*;
+        let ime = |e: egui::ImeEvent| egui::Event::Ime(e);
+        // 消した通知が空の Preedit の場合と、Disabled の場合
+        for cleared in [Preedit(String::new()), Disabled] {
+            let mut h = Harness::new("x");
+            let mut g = ImeGuard::default();
+            h.focus(ed());
+            h.guarded(&mut g, 0.05, vec![ime(Enabled), ime(Preedit("あい".into()))]);
+            h.guarded(&mut g, 0.05, vec![ime(Preedit("あ".into()))]);
+            h.guarded(&mut g, 0.05, vec![ime(cleared.clone())]);
+            h.guarded(
+                &mut g,
+                0.05,
+                vec![ime(Disabled), ime(Commit("あ".into())), ime(Disabled), ime(Disabled)],
+            );
+            assert_eq!(h.text, "x", "{cleared:?}");
+            // その後の通常の変換・確定は効く
+            h.guarded(&mut g, 0.05, vec![ime(Enabled), ime(Preedit("かんじ".into()))]);
+            h.guarded(
+                &mut g,
+                0.05,
+                vec![ime(Disabled), ime(Commit("漢字".into())), ime(Disabled)],
+            );
+            h.guarded(&mut g, 0.05, vec![ime(Disabled)]);
+            assert_eq!(h.text, "x漢字", "{cleared:?}");
+        }
+    }
+
+    /// 変換中の文字列なしに来る確定 (全角スペースなど) はそのまま入る
+    #[test]
+    fn ime_direct_commit_kept() {
+        use egui::ImeEvent::*;
+        let ime = |e: egui::ImeEvent| egui::Event::Ime(e);
+        let mut h = Harness::new("");
+        let mut g = ImeGuard::default();
+        h.focus(ed());
+        h.guarded(&mut g, 0.05, vec![ime(Enabled), ime(Preedit("あ".into()))]);
+        h.guarded(&mut g, 0.05, vec![ime(Disabled), ime(Commit("あ".into())), ime(Disabled)]);
+        h.guarded(&mut g, 0.05, vec![ime(Disabled)]);
+        assert_eq!(h.text, "あ");
+        // ImeGuard が Commit をそのまま通すことを確かめる (TextEdit への反映は egui 次第)
+        let mut evs = vec![ime(Disabled), ime(Commit("\u{3000}".into())), ime(Disabled)];
+        g.filter(h.t + 0.05, &mut evs);
+        assert!(evs.contains(&ime(Commit("\u{3000}".into()))));
     }
 
     /// Enter が次のフレームに来ても (直後なら) 改行を入れない。変換中の Enter も同様
