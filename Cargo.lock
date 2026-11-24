@@ -2658,12 +2658,14 @@ dependencies = [
 
 [[package]]
 name = "rs_editor"
-version = "1.0.1-dev2"
+version = "1.0.1-dev3"
 dependencies = [
  "chardetng",
  "eframe",
  "encoding_rs",
+ "raw-window-handle",
  "rfd",
+ "windows-sys 0.52.0",
  "winresource",
 ]
 

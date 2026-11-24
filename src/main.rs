@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod encoding;
+mod ime;
 mod search;
 
 use eframe::egui;
@@ -168,7 +169,10 @@ fn indent_newline(text: &str, sel: (usize, usize)) -> (String, usize) {
     let chars: Vec<char> = text.chars().collect();
     let s = sel.0.min(chars.len());
     let e = sel.1.clamp(s, chars.len());
-    let line_start = chars[..s].iter().rposition(|&c| c == '\n').map_or(0, |p| p + 1);
+    let line_start = chars[..s]
+        .iter()
+        .rposition(|&c| c == '\n')
+        .map_or(0, |p| p + 1);
     let indent: String = chars[line_start..s]
         .iter()
         .take_while(|&&c| c == ' ' || c == '\t')
@@ -288,29 +292,101 @@ fn preedit_rects(galley: &egui::Galley, range: (usize, usize)) -> Vec<egui::Rect
     out
 }
 
-/// 未確定文字列に、淡い背景と 2px の下線を重ねて描く
+/// 未確定文字列に下線と背景を重ねて描く。
+///
+/// `segs` (IME から取得した文節) があれば文節ごとに描き分ける:
+/// 変換対象の文節は太い下線と濃い背景、他の変換済み文節は細い下線、
+/// 未変換の入力は細い点線。文節の間には隙間を空ける。
+/// `segs` が空のときは未確定文字列全体を 1 つの範囲として描く。
 fn paint_preedit(
     ui: &egui::Ui,
     galley: &egui::Galley,
     galley_pos: egui::Pos2,
     range: (usize, usize),
+    segs: &[ime::Segment],
 ) {
+    use ime::Kind;
     let accent = ui.visuals().selection.stroke.color;
-    let tint = egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 40);
+    let text_color = ui.visuals().text_color();
+    let alpha =
+        |c: egui::Color32, a: u8| egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
     let painter = ui.painter();
-    for r in preedit_rects(galley, range) {
-        let r = r.translate(galley_pos.to_vec2());
-        painter.rect_filled(r, 0.0, tint);
-        let y = r.max.y - 1.0;
-        painter.line_segment(
-            [egui::pos2(r.min.x, y), egui::pos2(r.max.x, y)],
-            egui::Stroke::new(2.0, accent),
-        );
+    let off = galley_pos.to_vec2();
+    let n = range.1 - range.0;
+    if segs.is_empty() || segs.last().map(|s| s.range.end) != Some(n) {
+        for r in preedit_rects(galley, range) {
+            let r = r.translate(off);
+            painter.rect_filled(r, 0.0, alpha(accent, 40));
+            painter.line_segment(
+                [
+                    egui::pos2(r.min.x, r.max.y - 1.0),
+                    egui::pos2(r.max.x, r.max.y - 1.0),
+                ],
+                egui::Stroke::new(2.0, accent),
+            );
+        }
+        return;
+    }
+    for (i, seg) in segs.iter().enumerate() {
+        let last = i + 1 == segs.len();
+        let (a, b) = (range.0 + seg.range.start, range.0 + seg.range.end);
+        for r in preedit_rects(galley, (a, b)) {
+            let r = r.translate(off);
+            // 文節の境目が分かるよう、末尾側を 1px 空ける
+            let x1 = if last {
+                r.max.x
+            } else {
+                (r.max.x - 1.0).max(r.min.x)
+            };
+            match seg.kind {
+                Kind::Target => {
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(r.min, egui::pos2(x1, r.max.y)),
+                        0.0,
+                        alpha(accent, 90),
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(r.min.x, r.max.y - 1.0),
+                            egui::pos2(x1, r.max.y - 1.0),
+                        ],
+                        egui::Stroke::new(2.5, accent),
+                    );
+                }
+                Kind::Converted => {
+                    painter.line_segment(
+                        [
+                            egui::pos2(r.min.x, r.max.y - 0.5),
+                            egui::pos2(x1, r.max.y - 0.5),
+                        ],
+                        egui::Stroke::new(1.0, text_color),
+                    );
+                }
+                Kind::Input => {
+                    // 点線
+                    let stroke = egui::Stroke::new(1.0, text_color);
+                    let y = r.max.y - 0.5;
+                    let mut x = r.min.x;
+                    while x < x1 {
+                        painter.line_segment(
+                            [egui::pos2(x, y), egui::pos2((x + 2.0).min(x1), y)],
+                            stroke,
+                        );
+                        x += 4.0;
+                    }
+                }
+            }
+        }
     }
 }
 
 /// TextEdit の出力から、変換中の範囲に下線などを描く
-fn paint_preedit_for(ui: &egui::Ui, out: &egui::text_edit::TextEditOutput, composing: bool) {
+fn paint_preedit_for(
+    ui: &egui::Ui,
+    out: &egui::text_edit::TextEditOutput,
+    composing: bool,
+    segs: &[ime::Segment],
+) {
     if !out.response.has_focus() {
         return;
     }
@@ -319,7 +395,7 @@ fn paint_preedit_for(ui: &egui::Ui, out: &egui::text_edit::TextEditOutput, compo
         (a.ccursor.index, b.ccursor.index)
     });
     if let Some(r) = preedit_range(composing, sel) {
-        paint_preedit(ui, &out.galley, out.galley_pos, r);
+        paint_preedit(ui, &out.galley, out.galley_pos, r, segs);
     }
 }
 
@@ -329,6 +405,7 @@ fn singleline_with_preedit(
     text: &mut String,
     id: Option<egui::Id>,
     composing: bool,
+    segs: &[ime::Segment],
 ) -> egui::Response {
     let old = hide_selection_fill(ui, composing);
     let mut te = egui::TextEdit::singleline(text).desired_width(200.0);
@@ -337,7 +414,7 @@ fn singleline_with_preedit(
     }
     let out = te.show(ui);
     ui.visuals_mut().selection.bg_fill = old;
-    paint_preedit_for(ui, &out, composing);
+    paint_preedit_for(ui, &out, composing, segs);
     out.response
 }
 
@@ -389,6 +466,10 @@ enum Action {
 struct ImeGuard {
     /// 変換中 (未確定文字列がある) か
     composing: bool,
+    /// 変換中の未確定文字列 (IME から取得した文節情報との照合用)
+    preedit: String,
+    /// 変換中の文節 (取得できなければ空 = 全体を 1 つの範囲として扱う)
+    segs: Vec<ime::Segment>,
     /// 直近の Commit の時刻 (egui の time)
     last_commit: Option<f64>,
 }
@@ -401,15 +482,18 @@ impl ImeGuard {
         events.retain(|e| match e {
             egui::Event::Ime(egui::ImeEvent::Preedit(t)) => {
                 self.composing = !t.is_empty();
+                self.preedit = t.clone();
                 true
             }
             egui::Event::Ime(egui::ImeEvent::Commit(_)) => {
                 self.composing = false;
+                self.preedit.clear();
                 self.last_commit = Some(time);
                 true
             }
             egui::Event::Ime(egui::ImeEvent::Disabled) => {
                 self.composing = false;
+                self.preedit.clear();
                 true
             }
             egui::Event::Key {
@@ -1161,6 +1245,7 @@ impl App {
     fn find_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Action>) {
         let qid = egui::Id::new("find_query");
         let composing = self.ime_guard.composing;
+        let segs = self.ime_guard.segs.clone();
         // 検索欄にフォーカスがあるときの Enter / Shift+Enter。欄に入力させないよう先に取り除く
         // (Shift を含む組み合わせを先に判定する。consume_key は余分な Shift を無視するため)
         if ui.memory(|m| m.has_focus(qid)) {
@@ -1192,7 +1277,7 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.label("検索:");
-            let r = singleline_with_preedit(ui, &mut self.find.query, Some(qid), composing);
+            let r = singleline_with_preedit(ui, &mut self.find.query, Some(qid), composing, &segs);
             if std::mem::take(&mut self.find.focus_query) {
                 r.request_focus();
             }
@@ -1218,7 +1303,7 @@ impl App {
         if self.find.show_replace {
             ui.horizontal(|ui| {
                 ui.label("置換:");
-                singleline_with_preedit(ui, &mut self.find.replacement, None, composing);
+                singleline_with_preedit(ui, &mut self.find.replacement, None, composing, &segs);
                 if ui
                     .button("置換")
                     .on_hover_text("現在の一致を置換して次へ")
@@ -1262,6 +1347,7 @@ impl App {
         let cs = self.find.case_sensitive;
         let dark = ui.visuals().dark_mode;
         let composing = self.ime_guard.composing;
+        let segs = self.ime_guard.segs.clone();
         let auto_indent = self.auto_indent;
         let d = &mut self.docs[self.active];
         let id = editor_id(d.id);
@@ -1355,7 +1441,7 @@ impl App {
                         .layouter(&mut layouter)
                         .show(ui);
                     ui.visuals_mut().selection.bg_fill = old_fill;
-                    paint_preedit_for(ui, &out, composing);
+                    paint_preedit_for(ui, &out, composing, &segs);
                     if out.response.changed() {
                         d.dirty = true;
                         d.rev += 1;
@@ -1444,7 +1530,18 @@ impl eframe::App for App {
         self.ime_guard.filter(time, &mut raw_input.events);
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // 変換中は IME から文節 (どれが変換対象か) を取得する。失敗時は空 (全体表示)
+        if self.ime_guard.composing {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            let hwnd = match frame.window_handle().map(|h| h.as_raw()) {
+                Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+                _ => 0,
+            };
+            self.ime_guard.segs = ime::query(hwnd, &self.ime_guard.preedit);
+        } else if !self.ime_guard.segs.is_empty() {
+            self.ime_guard.segs.clear();
+        }
         let mut acts = Vec::new();
 
         // ウィンドウへのドラッグ&ドロップで開く
@@ -1807,12 +1904,23 @@ mod undo_tests {
         let mut h = Harness::new("");
         let mut g = ImeGuard::default();
         h.focus(ed());
-        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Enabled)]);
-        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Preedit("あ".into()))]);
         h.guarded(
             &mut g,
             0.05,
-            vec![enter(), egui::Event::Ime(egui::ImeEvent::Commit("あ".into()))],
+            vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
+        );
+        h.guarded(
+            &mut g,
+            0.05,
+            vec![egui::Event::Ime(egui::ImeEvent::Preedit("あ".into()))],
+        );
+        h.guarded(
+            &mut g,
+            0.05,
+            vec![
+                enter(),
+                egui::Event::Ime(egui::ImeEvent::Commit("あ".into())),
+            ],
         );
         assert_eq!(h.text, "あ");
     }
@@ -1823,12 +1931,23 @@ mod undo_tests {
         let mut h = Harness::new("");
         let mut g = ImeGuard::default();
         h.focus(ed());
-        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Enabled)]);
-        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Preedit("い".into()))]);
         h.guarded(
             &mut g,
             0.05,
-            vec![egui::Event::Ime(egui::ImeEvent::Commit("い".into())), enter()],
+            vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
+        );
+        h.guarded(
+            &mut g,
+            0.05,
+            vec![egui::Event::Ime(egui::ImeEvent::Preedit("い".into()))],
+        );
+        h.guarded(
+            &mut g,
+            0.05,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Commit("い".into())),
+                enter(),
+            ],
         );
         assert_eq!(h.text, "い");
     }
@@ -1839,10 +1958,18 @@ mod undo_tests {
         let mut h = Harness::new("");
         let mut g = ImeGuard::default();
         h.focus(ed());
-        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Preedit("う".into()))]);
+        h.guarded(
+            &mut g,
+            0.05,
+            vec![egui::Event::Ime(egui::ImeEvent::Preedit("う".into()))],
+        );
         // 変換中に Enter だけのフレーム、その次に Commit
         h.guarded(&mut g, 0.01, vec![enter()]);
-        h.guarded(&mut g, 0.01, vec![egui::Event::Ime(egui::ImeEvent::Commit("う".into()))]);
+        h.guarded(
+            &mut g,
+            0.01,
+            vec![egui::Event::Ime(egui::ImeEvent::Commit("う".into()))],
+        );
         // Commit の直後のフレームに Enter
         h.guarded(&mut g, 0.01, vec![enter()]);
         assert_eq!(h.text, "う");
@@ -1856,8 +1983,16 @@ mod undo_tests {
         h.focus(ed());
         h.guarded(&mut g, 0.05, vec![enter()]);
         assert_eq!(h.text, "\n");
-        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Preedit("え".into()))]);
-        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Commit("え".into()))]);
+        h.guarded(
+            &mut g,
+            0.05,
+            vec![egui::Event::Ime(egui::ImeEvent::Preedit("え".into()))],
+        );
+        h.guarded(
+            &mut g,
+            0.05,
+            vec![egui::Event::Ime(egui::ImeEvent::Commit("え".into()))],
+        );
         h.guarded(&mut g, 0.5, vec![enter()]);
         assert_eq!(h.text, "\nえ\n");
     }
@@ -1974,11 +2109,18 @@ mod undo_tests {
         let mut h = Harness::with_indent("  ");
         let mut g = ImeGuard::default();
         h.select(2, 2);
-        h.guarded(&mut g, 0.05, vec![egui::Event::Ime(egui::ImeEvent::Preedit("あ".into()))]);
         h.guarded(
             &mut g,
             0.05,
-            vec![enter(), egui::Event::Ime(egui::ImeEvent::Commit("あ".into()))],
+            vec![egui::Event::Ime(egui::ImeEvent::Preedit("あ".into()))],
+        );
+        h.guarded(
+            &mut g,
+            0.05,
+            vec![
+                enter(),
+                egui::Event::Ime(egui::ImeEvent::Commit("あ".into())),
+            ],
         );
         h.guarded(&mut g, 0.01, vec![enter()]); // 確定直後の遅れた Enter
         assert_eq!(h.text, "  あ");
@@ -2027,7 +2169,11 @@ mod undo_tests {
         h.guarded(&mut g, 0.05, ime(egui::ImeEvent::Preedit("か".into())));
         assert_eq!(range(&h, &g), Some((base, base + 1)));
         h.guarded(&mut g, 0.05, ime(egui::ImeEvent::Preedit("かん".into())));
-        assert_eq!(range(&h, &g), Some((base, base + 2)), "伸びても開始位置は同じ");
+        assert_eq!(
+            range(&h, &g),
+            Some((base, base + 2)),
+            "伸びても開始位置は同じ"
+        );
         h.guarded(&mut g, 0.05, ime(egui::ImeEvent::Preedit(String::new())));
         assert_eq!(range(&h, &g), None, "取り消し (空 Preedit)");
         assert!(!h.text.contains('か'));
@@ -2060,6 +2206,9 @@ mod undo_tests {
         assert_eq!(r.len(), 2);
         assert!(r[0].min.y < r[1].min.y);
         assert!(r[0].width() > 0.0 && r[1].width() > 0.0);
-        assert!(preedit_rects(&galley, (4, 5)).is_empty(), "改行だけは描かない");
+        assert!(
+            preedit_rects(&galley, (4, 5)).is_empty(),
+            "改行だけは描かない"
+        );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rs_editor"
-version = "1.0.1-dev2"
+version = "1.0.1-dev3"
 edition = "2021"
 description = "Tabbed text editor with character encoding conversion"
 license = "MIT"
@@ -11,6 +11,8 @@ eframe = "0.29.1"
 rfd = "0.15"
 encoding_rs = "0.8"
 chardetng = "0.1"
+# ウィンドウハンドル (IME の文節取得用) を eframe::Frame から得る
+raw-window-handle = "0.6"
 
 [profile.release]
 opt-level = 3
@@ -21,3 +23,9 @@ panic = "abort"
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+
+# IME の文節 (IMM32) の取得に使う
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.52"
+features = ["Win32_Foundation", "Win32_Globalization", "Win32_UI_Input_Ime"]
