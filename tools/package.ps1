@@ -3,13 +3,14 @@
 # 使い方 (リポジトリのルートで):  pwsh tools\package.ps1
 #
 # 1. cargo build --release --target x86_64-pc-windows-msvc --locked を行い、
-#    cargo が報告した exe (compiler-artifact の executable) を RsEditor.exe としてコピー
+#    cargo が報告した exe (compiler-artifact の executable) を検査する
 #    (exe は x64 の PE で、バージョン情報が Cargo.toml の version と一致することを確認する)
 # 2. 実行ごとの一時フォルダ (dist\.work-*) に RsEditor\ を作って配布するファイルを集める
 #    (フォルダ名・exe 名にはバージョンを付けない。更新時は上書きしてもらう)
 # 3. 同じ一時フォルダで zip / 7z を作り、両方を 7z t で検査して中身を確認する
-# 4. 検査に通ってから、両方を dist\RsEditor-v<version>-windows-x64.zip / .7z に置き換える
-#    (途中で失敗したら以前のアーカイブをそのまま残す / 元に戻す)
+# 4. すべての検査に通ってから、両方を dist\RsEditor-v<version>-windows-x64.zip / .7z に置き換え、
+#    最後にルートの RsEditor.exe を更新する (途中で失敗したら以前のものを元に戻す。
+#    戻せなかった場合は退避先 dist\.work-* を残して場所を表示する)
 #
 # -DistDir は出力先 (既定は dist)。テスト用。
 
@@ -64,7 +65,6 @@ $vi = (Get-Item $exePath).VersionInfo
 if ($vi.FileVersion -ne $version -or $vi.ProductVersion -ne $version) {
     throw "exe のバージョン情報 (FileVersion=$($vi.FileVersion), ProductVersion=$($vi.ProductVersion)) が Cargo.toml の version ($version) と一致しません"
 }
-Copy-Item $exePath 'RsEditor.exe' -Force
 
 # 2. 一時フォルダに配布フォルダを作る (以前のアーカイブには触れない)
 if (-not $DistDir) { $DistDir = Join-Path $root 'dist' }
@@ -72,11 +72,12 @@ New-Item -ItemType Directory -Force $DistDir | Out-Null
 $DistDir = (Resolve-Path $DistDir).Path
 $work = Join-Path $DistDir (".work-" + [Guid]::NewGuid().ToString('N'))
 $base = "RsEditor-v$version-windows-x64"
+$keepWork = $false
 try {
     $stage = Join-Path $work 'RsEditor'
     New-Item -ItemType Directory -Force $stage | Out-Null
 
-    Copy-Item 'RsEditor.exe' $stage
+    Copy-Item $exePath (Join-Path $stage 'RsEditor.exe')
     Copy-Item 'RsEditor_使い方ガイド.pptx' $stage
     Copy-Item 'samples' (Join-Path $stage 'samples') -Recurse
     if (-not (Test-Path 'LICENSE')) { throw 'LICENSE がありません' }
@@ -117,33 +118,49 @@ try {
         Pop-Location
     }
 
-    # 4. 検査に通った両方のアーカイブを dist に移す (失敗したら以前のものを戻す)
+    # 4. 検査がすべて通ってから公開する: アーカイブを dist に移し、最後にルートの RsEditor.exe を更新する。
+    #    途中で失敗したら以前のものを戻す。戻せなかった場合は $work (退避した以前のファイル) を残す。
     $backup = Join-Path $work 'backup'
     New-Item -ItemType Directory -Force $backup | Out-Null
-    $moved = @()
-    try {
+    $items = @(
         foreach ($ext in 'zip', '7z') {
-            $file = "$base.$ext"
-            $dest = Join-Path $DistDir $file
-            $had = Test-Path $dest
-            if ($had) { Move-Item $dest (Join-Path $backup $file) -Force }
-            $moved += [pscustomobject]@{ File = $file; Had = $had; Done = $false }
-            Move-Item (Join-Path $work $file) $dest -Force
-            $moved[-1].Done = $true
+            [pscustomobject]@{ Name = "$base.$ext"; Src = (Join-Path $work "$base.$ext"); Dest = (Join-Path $DistDir "$base.$ext"); Had = $false; Done = $false }
+        }
+        [pscustomobject]@{ Name = 'RsEditor.exe'; Src = $exePath; Dest = (Join-Path $root 'RsEditor.exe'); Had = $false; Done = $false }
+    )
+    try {
+        foreach ($it in $items) {
+            $it.Had = Test-Path $it.Dest
+            if ($it.Had) { Move-Item $it.Dest (Join-Path $backup $it.Name) -Force }
+            if ($it.Name -eq 'RsEditor.exe') { Copy-Item $it.Src $it.Dest -Force } else { Move-Item $it.Src $it.Dest -Force }
+            $it.Done = $true
         }
     }
     catch {
-        # 元に戻す: 新しく置いたものを消し、退避しておいた以前のものを戻す
-        foreach ($m in $moved) {
-            $dest = Join-Path $DistDir $m.File
-            if ($m.Done -and (Test-Path $dest)) { Remove-Item $dest -Force }
-            $old = Join-Path $backup $m.File
-            if ($m.Had -and (Test-Path $old)) { Move-Item $old $dest -Force }
+        $err = $_
+        $restoreFailed = $false
+        # 元に戻す: 新しく置いたものを消し、退避しておいた以前のものを戻す (1 つ失敗しても残りは続ける)
+        foreach ($it in $items) {
+            $old = Join-Path $backup $it.Name
+            try {
+                if ($it.Done -and (Test-Path $it.Dest)) { Remove-Item $it.Dest -Force }
+                if ($it.Had -and (Test-Path $old)) { Move-Item $old $it.Dest -Force }
+            }
+            catch {
+                $restoreFailed = $true
+                Write-Host "復元に失敗しました: $($it.Dest) ($($_.Exception.Message))" -ForegroundColor Red
+            }
         }
-        throw
+        if ($restoreFailed) {
+            $keepWork = $true
+            Write-Host "以前のファイルの退避先を残しました: $backup" -ForegroundColor Red
+            Write-Host "  手作業でここから dist (と RsEditor.exe) に戻してください。" -ForegroundColor Red
+        }
+        throw $err
     }
     foreach ($ext in 'zip', '7z') { Write-Host "created: $(Join-Path $DistDir "$base.$ext")" }
+    Write-Host "updated: $(Join-Path $root 'RsEditor.exe')"
 }
 finally {
-    if (Test-Path $work) { Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue }
+    if (-not $keepWork -and (Test-Path $work)) { Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue }
 }

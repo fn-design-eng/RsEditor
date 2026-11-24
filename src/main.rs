@@ -12,9 +12,10 @@ use egui::widgets::text_edit::TextEditState;
 use egui::{Key, KeyboardShortcut, Modifiers, ViewportCommand};
 use encoding::{Enc, Eol};
 use fileio::Fingerprint;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 const APP_NAME: &str = "RsEditor";
 /// Cargo.toml の version (例: "1.0.0")
@@ -82,31 +83,15 @@ struct DocStats {
     lines: usize,
 }
 
-/// 編集欄の表示 (galley) のキャッシュ。毎フレームの再レイアウト (全文のコピーとハッシュ) を避ける
-struct LayoutCache {
-    key: LayoutKey,
-    galley: Arc<egui::Galley>,
-}
-
-/// レイアウト結果が変わる条件のすべて。これが同じなら、前のフレームの galley を使い回せる
-#[derive(Clone, PartialEq)]
-struct LayoutKey {
-    rev: u64,
-    /// 折り返さないときは 0
-    wrap_width: u32,
-    font_size: u32,
-    text_color: egui::Color32,
-    dark: bool,
-    pixels_per_point: u32,
-    /// 検索結果の強調 (検索結果キャッシュの識別子。強調なしは 0)
-    find_stamp: u64,
-    /// 「現在の一致」として濃く表示する一致の番号
-    exact: Option<usize>,
-}
-
-/// galley の各表示行が属する論理行の番号 (1 始まり)。行番号を、見えている行からだけ描くために使う
+/// galley の各表示行が属する論理行の番号 (1 始まり)。行番号を、見えている行からだけ描くために使う。
+///
+/// galley そのものは持たない (egui が文字の描画用の画像 (フォントアトラス) を作り直したときに、
+/// 古い galley を使い回すと文字が崩れるため。galley は毎フレーム egui の
+/// キャッシュ (`Fonts::layout_job`) から受け取る)。どの galley の結果かを `Weak` で覚え、
+/// 同じ galley のときだけ使い回す (Weak は確保領域を生かすので、ポインタの再利用で
+/// 別の galley と取り違えることはない)
 struct RowLines {
-    galley: Arc<egui::Galley>,
+    galley: Weak<egui::Galley>,
     lines: Vec<u32>,
 }
 
@@ -132,21 +117,29 @@ fn first_visible_row(galley: &egui::Galley, galley_pos_y: f32, top: f32) -> usiz
         .partition_point(|r| galley_pos_y + r.rect.max.y < top)
 }
 
-/// 検索結果のキャッシュ。検索語・検索条件・文書の版が変わったときだけ作り直す
+/// 検索結果のキャッシュ。検索語・検索条件・文書の版が変わったときだけ作り直す。
+/// 一致は先頭から `search::MAX_STORED_MATCHES` 件までしか覚えない (表示の強調と件数表示用)
 struct FindCache {
     rev: u64,
-    /// 作り直すたびに変わる識別子 (表示のキャッシュの判定に使う。0 は使わない)
-    stamp: u64,
     query: String,
     case_sensitive: bool,
     /// 一致箇所 (文字位置の範囲)
     matches: Vec<(usize, usize)>,
     /// 一致箇所 (バイト位置の範囲)。表示の強調に使う
     byte_ranges: Vec<(usize, usize)>,
+    /// 上限を超える一致が、まだ後ろにあるか
+    capped: bool,
 }
 
-/// 検索結果の識別子の採番
-static FIND_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// このフレームの、検索の現在位置 (件数の表示と、現在の一致の強調で共有する。
+/// 選択範囲から 1 フレームに 1 回だけ求める)
+#[derive(Clone, Copy, Default)]
+struct FindPos {
+    /// 選択がちょうど一致箇所と同じとき、その一致の番号
+    exact: Option<usize>,
+    /// 選択の後ろの次の一致 (選択が一致箇所そのものならその番号)
+    current: Option<usize>,
+}
 
 /// 1つのタブ (= 1つの文書)
 struct Doc {
@@ -168,9 +161,14 @@ struct Doc {
     line_col: (usize, usize),
     /// 文字列を変更するたびに増やす版番号 (各種キャッシュの判定に使う)
     rev: u64,
+    /// 変更の世代。本文の編集のほか、保存・保存先の変更・文字コード/改行コード/BOM の変更でも
+    /// 増える。バックグラウンドの読み込みの結果を取り込んでよいか (読み込み中に文書が
+    /// 変わっていないか) の判定に使う
+    generation: u64,
+    /// 読み込み時に改行コードが混在していて、まだ保存して統一していないか
+    mixed_eol: bool,
     find_cache: Option<FindCache>,
     stats: Option<DocStats>,
-    layout_cache: Option<LayoutCache>,
     row_lines: Option<RowLines>,
 }
 
@@ -191,9 +189,10 @@ impl Doc {
             cursor_idx: 0,
             line_col: (1, 1),
             rev: 0,
+            generation: 0,
+            mixed_eol: false,
             find_cache: None,
             stats: None,
-            layout_cache: None,
             row_lines: None,
         }
     }
@@ -206,9 +205,21 @@ impl Doc {
         d.eol = l.eol;
         d.text = l.text;
         d.lossy_load = l.lossy;
+        d.mixed_eol = l.mixed_eol;
         d.fingerprint = l.fingerprint;
         d.mark_saved();
         d
+    }
+
+    /// 本文を変更したとき (版と世代を進める)
+    fn edited(&mut self) {
+        self.rev += 1;
+        self.generation += 1;
+    }
+
+    /// 本文以外 (保存・保存先・文字コード・改行コード) を変更したとき (世代だけ進める)
+    fn meta_changed(&mut self) {
+        self.generation += 1;
     }
 
     fn title(&self) -> String {
@@ -266,15 +277,20 @@ impl Doc {
             Some(c) if c.rev == self.rev && c.case_sensitive == case_sensitive && c.query == query
         );
         if !fresh {
-            let byte_ranges = search::find_bytes(&self.text, query, case_sensitive);
+            let (byte_ranges, capped) = search::find_bytes_limited(
+                &self.text,
+                query,
+                case_sensitive,
+                search::MAX_STORED_MATCHES,
+            );
             let matches = search::bytes_to_chars(&self.text, &byte_ranges);
             self.find_cache = Some(FindCache {
                 rev: self.rev,
-                stamp: FIND_STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 query: query.to_owned(),
                 case_sensitive,
                 matches,
                 byte_ranges,
+                capped,
             });
         }
     }
@@ -323,6 +339,95 @@ fn set_editor_sel(ctx: &egui::Context, id: egui::Id, start: usize, end: usize) {
     state.store(ctx, id);
 }
 
+/// 本文の大きさに応じた、Undo 履歴の最大件数。
+///
+/// 履歴は各時点の本文を丸ごと持つので、大きな文書では件数を絞らないとメモリを使い尽くす。
+/// egui 0.29 の `TextEditState::undoer()` は履歴全体を複製して返し、複製を避ける API が
+/// 無い (複製の確保の失敗も捕まえられない)。そこで、複製されても困らない大きさに収まるよう、
+/// 文書の大きさに反比例して件数を減らす (全体で約 256 MiB、最小 2 件、最大 100 件)。
+fn undo_limit(text_len: usize) -> usize {
+    const BUDGET: usize = 256 * 1024 * 1024;
+    (BUDGET / text_len.max(1)).clamp(2, 100)
+}
+
+type Undoer = egui::util::undoer::Undoer<(CCursorRange, String)>;
+
+fn bounded_undoer(limit: usize) -> Undoer {
+    Undoer::with_settings(egui::util::undoer::Settings {
+        max_undos: limit,
+        ..Default::default()
+    })
+}
+
+/// 編集欄の Undo 履歴に設定している件数の上限 (egui の履歴からは読み出せないので、
+/// 設定したときに記録しておく)。記録が無ければ既定の 100
+#[derive(Clone, Copy)]
+struct UndoLimit(usize);
+
+fn recorded_undo_limit(ctx: &egui::Context, id: egui::Id) -> usize {
+    ctx.data(|d| d.get_temp::<UndoLimit>(id)).map_or(100, |l| l.0)
+}
+
+/// `replace_text_with_undo` の、失敗しうる準備 (複製・予約) をすべて済ませたもの。
+/// `apply` は失敗しない。保存のように「ディスクへ書いた後で画面を更新する」処理が、
+/// 書いた後に失敗して画面とファイルが食い違うことのないよう、準備だけを先にできるようにしてある
+struct PreparedReplace {
+    new_text: String,
+    undoer: Undoer,
+    limit: usize,
+    range: CCursorRange,
+}
+
+/// 置換後の本文と Undo 履歴を用意する。メモリが足りずに複製できないときは `None`
+/// (何も変えない)
+fn prepare_replace(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &str,
+    new_text: String,
+    new_sel: (usize, usize),
+) -> Option<PreparedReplace> {
+    let (old_copy, new_copy) = (try_clone(text)?, try_clone(&new_text)?);
+    let state = TextEditState::load(ctx, id).unwrap_or_default();
+    let old_range = state
+        .cursor
+        .char_range()
+        .unwrap_or_else(|| CCursorRange::one(CCursor::new(0)));
+    let new_range = CCursorRange::two(CCursor::new(new_sel.0), CCursor::new(new_sel.1));
+    // 大きな文書では、履歴の件数を絞った新しい履歴にする (それ以前の履歴は捨てる)
+    let want = undo_limit(text.len().max(new_text.len()));
+    let recorded = recorded_undo_limit(ctx, id);
+    let (mut undoer, limit) = if want < recorded {
+        (bounded_undoer(want), want)
+    } else {
+        (state.undoer(), recorded)
+    };
+    undoer.add_undo(&(old_range, old_copy));
+    let new_state = (new_range, new_copy);
+    // 新しい編集なので、Undo 後に残っている Redo を捨てる。egui 0.29 の Undoer には
+    // Redo を消す API が無いが、最新の履歴と異なる状態で redo() を呼ぶと Redo が消える
+    let _ = undoer.redo(&new_state);
+    undoer.add_undo(&new_state);
+    Some(PreparedReplace {
+        new_text,
+        undoer,
+        limit,
+        range: new_range,
+    })
+}
+
+impl PreparedReplace {
+    /// 本文・履歴・キャレットを置き換える (新しい確保をしない)
+    fn apply(self, ctx: &egui::Context, id: egui::Id, text: &mut String) {
+        let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+        *text = self.new_text;
+        state.set_undoer(self.undoer);
+        state.cursor.set_char_range(Some(self.range));
+        state.store(ctx, id);
+        ctx.data_mut(|d| d.insert_temp(id, UndoLimit(self.limit)));
+    }
+}
+
 /// 置換など、編集欄の外から本文を書き換える。
 ///
 /// egui の Undo 履歴は編集欄にフォーカスがある間しか記録されないため、そのまま書き換えると
@@ -338,27 +443,13 @@ fn replace_text_with_undo(
     new_text: String,
     new_sel: (usize, usize),
 ) -> bool {
-    let (Some(old_copy), Some(new_copy)) = (try_clone(text), try_clone(&new_text)) else {
-        return false;
-    };
-    let mut state = TextEditState::load(ctx, id).unwrap_or_default();
-    let old_range = state
-        .cursor
-        .char_range()
-        .unwrap_or_else(|| CCursorRange::one(CCursor::new(0)));
-    let new_range = CCursorRange::two(CCursor::new(new_sel.0), CCursor::new(new_sel.1));
-    let mut undoer = state.undoer();
-    undoer.add_undo(&(old_range, old_copy));
-    *text = new_text;
-    let new_state = (new_range, new_copy);
-    // 新しい編集なので、Undo 後に残っている Redo を捨てる。egui 0.29 の Undoer には
-    // Redo を消す API が無いが、最新の履歴と異なる状態で redo() を呼ぶと Redo が消える
-    let _ = undoer.redo(&new_state);
-    undoer.add_undo(&new_state);
-    state.set_undoer(undoer);
-    state.cursor.set_char_range(Some(new_range));
-    state.store(ctx, id);
-    true
+    match prepare_replace(ctx, id, text, new_text, new_sel) {
+        Some(p) => {
+            p.apply(ctx, id, text);
+            true
+        }
+        None => false,
+    }
 }
 
 /// 確保に失敗しても落ちない文字列の複製
@@ -370,28 +461,67 @@ fn try_clone(s: &str) -> Option<String> {
 }
 
 /// 編集欄の Undo 履歴とキャレットを初期状態に戻す (文書を読み直したとき、読み直す前の履歴で
-/// 別の内容に戻ってしまわないように)
-fn reset_editor_state(ctx: &egui::Context, id: egui::Id) {
+/// 別の内容に戻ってしまわないように)。履歴の件数は、新しい本文の大きさ `text_len` に合わせる
+fn reset_editor_state(ctx: &egui::Context, id: egui::Id, text_len: usize) {
     let mut state = TextEditState::load(ctx, id).unwrap_or_default();
-    state.set_undoer(Default::default());
+    let limit = undo_limit(text_len);
+    state.set_undoer(bounded_undoer(limit));
     state
         .cursor
         .set_char_range(Some(CCursorRange::one(CCursor::new(0))));
     state.store(ctx, id);
+    ctx.data_mut(|d| d.insert_temp(id, UndoLimit(limit)));
 }
 
-/// 現在行の行頭からキャレット (文字位置 `pos`) までの空白・タブ (= 引き継ぐインデント)
-fn line_indent(text: &str, pos: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let pos = pos.min(chars.len());
-    let line_start = chars[..pos]
+/// 閉じた文書の編集欄の状態 (Undo 履歴を含む) を、egui の記憶から取り除く。
+/// 取り除かないと、閉じたタブの履歴 (本文の複製を含む) がずっと残る
+fn forget_editor_state(ctx: &egui::Context, id: egui::Id) {
+    ctx.data_mut(|d| {
+        d.remove::<TextEditState>(id);
+        d.remove::<UndoLimit>(id);
+    });
+}
+
+/// 現在行の行頭からキャレット (バイト位置 `pos`) までの空白・タブ (= 引き継ぐインデント)。
+/// バイト列を後ろへたどるだけで、本文を複製しない
+fn line_indent(text: &str, pos: usize) -> &str {
+    let b = text.as_bytes();
+    let pos = pos.min(b.len());
+    let line_start = b[..pos]
         .iter()
-        .rposition(|&c| c == '\n')
+        .rposition(|&c| c == b'\n')
         .map_or(0, |p| p + 1);
-    chars[line_start..pos]
+    let n = b[line_start..pos]
         .iter()
-        .take_while(|&&c| c == ' ' || c == '\t')
-        .collect()
+        .take_while(|&&c| c == b' ' || c == b'\t')
+        .count();
+    &text[line_start..line_start + n]
+}
+
+/// 本文を書き換える入力か (この入力の後ろにある Enter は、書き換え後の本文で処理する必要がある)
+fn mutates_text(e: &egui::Event) -> bool {
+    match e {
+        egui::Event::Text(_)
+        | egui::Event::Paste(_)
+        | egui::Event::Cut
+        | egui::Event::Ime(egui::ImeEvent::Preedit(_) | egui::ImeEvent::Commit(_)) => true,
+        egui::Event::Key {
+            key, pressed: true, ..
+        } => matches!(
+            key,
+            Key::Backspace
+                | Key::Delete
+                | Key::Tab
+                | Key::Enter
+                | Key::Z
+                | Key::Y
+                | Key::H
+                | Key::K
+                | Key::U
+                | Key::W
+        ),
+        _ => false,
+    }
 }
 
 /// 編集欄にフォーカスがあるとき、Enter (Ctrl/Alt なし。Shift 付きも含む) の押下を、
@@ -401,32 +531,49 @@ fn line_indent(text: &str, pos: usize) -> String {
 /// 文字入力として egui の TextEdit が処理するので、Undo/Redo の履歴も egui の通常の入力と
 /// 同じに扱われる (改行とインデントは 1 つの入力として一緒に戻る)。
 /// IME の確定 Enter は `ImeGuard` が先に取り除くので、ここへは届かない。
-fn apply_auto_indent(ctx: &egui::Context, id: egui::Id, text: &str) {
+///
+/// インデントは「このフレームの最初の時点の本文」から求める。同じフレームで Enter より前に
+/// 本文を書き換える入力 (文字入力・貼り付けなど) があると、その結果が反映されていない本文で
+/// 求めてしまう。そのときは、その Enter と後ろのイベントをこのフレームの入力から外して返す。
+/// 呼び出し側は、それを次のフレームの入力の先頭へ戻す (`App::deferred_events`)。
+fn apply_auto_indent(ctx: &egui::Context, id: egui::Id, text: &str) -> Vec<egui::Event> {
     if !ctx.memory(|m| m.has_focus(id)) {
-        return;
+        return Vec::new();
     }
     let is_enter = |e: &egui::Event| {
         matches!(e, egui::Event::Key { key: Key::Enter, pressed: true, modifiers, .. }
             if !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.mac_cmd)
     };
     if !ctx.input(|i| i.events.iter().any(is_enter)) {
-        return;
+        return Vec::new();
     }
     let Some(range) = TextEditState::load(ctx, id).and_then(|s| s.cursor.char_range()) else {
-        return; // 状態がまだ無いときは egui の通常の改行に任せる
+        return Vec::new(); // 状態がまだ無いときは egui の通常の改行に任せる
     };
-    let indent = line_indent(text, range.sorted()[0].index);
-    if indent.is_empty() {
-        return; // インデントなし: egui の通常の改行と同じ
-    }
-    let newline = format!("\n{indent}");
+    let caret = search::char_to_byte(text, range.sorted()[0].index);
+    let newline = format!("\n{}", line_indent(text, caret));
+    let has_indent = newline.len() > 1;
     ctx.input_mut(|i| {
-        for e in i.events.iter_mut() {
+        let mut mutated = false;
+        let mut defer_from = None;
+        for (n, e) in i.events.iter_mut().enumerate() {
             if is_enter(e) {
-                *e = egui::Event::Text(newline.clone());
+                if mutated {
+                    defer_from = Some(n);
+                    break;
+                }
+                if has_indent {
+                    *e = egui::Event::Text(newline.clone());
+                }
+                mutated = true;
+            } else if mutates_text(e) {
+                mutated = true;
             }
         }
-    });
+        defer_from
+            .map(|n| i.events.split_off(n))
+            .unwrap_or_default()
+    })
 }
 
 /// 一致箇所の背景を付けた LayoutJob 用のセクションを作る。全体を隙間なく覆うように並べる
@@ -744,12 +891,15 @@ enum Then {
 }
 
 /// 保存の途中でユーザーが「それでよい」と答えた確認 (同じ確認を繰り返さないため)
-#[derive(Clone, Copy, Default, Debug, PartialEq)]
+#[derive(Clone, Default, Debug, PartialEq)]
 struct Confirmed {
     /// 読み込み時にデコードできなかったバイトが失われること
     lossy_load: bool,
-    /// ファイルが外部で変更されていること
-    conflict: bool,
+    /// ファイルが外部で変更されていること。「上書きする」と答えたときに見せた状態の指紋を
+    /// 覚えておく (`Some(None)` は「存在しない」状態)。単なる真偽値にすると、承知した後に
+    /// 別の確認 (文字コードの警告など) を出している間にファイルがもう一度変わっても、
+    /// 気づかずに上書きしてしまう。保存の直前に、この指紋のとおりかをもう一度確かめる
+    conflict: Option<Option<Fingerprint>>,
     /// 文字コードで表現できない文字が変わること
     lossy: bool,
 }
@@ -774,17 +924,26 @@ enum Modal {
         then: Then,
         ok: Confirmed,
     },
-    /// 読み込み後に、ファイルが他のプログラムで変更・削除された
+    /// 読み込み後に、ファイルが他のプログラムで変更・削除・作成された。
+    /// `seen` は、いま見えているファイルの指紋 (`None` は存在しない)。「上書きする」と
+    /// 答えたら、この状態を承知したものとして扱う
     Conflict {
         id: u64,
         path: PathBuf,
         then: Then,
         ok: Confirmed,
+        seen: Option<Fingerprint>,
     },
     /// 未保存の編集を捨てて、指定した文字コードで読み直す
     ConfirmReload { id: u64, enc: Enc },
     /// 大きなファイルを開く確認
     ConfirmLargeOpen { path: PathBuf, size: u64 },
+    /// UTF-32 の BOM で始まるファイル (未対応)。UTF-16 としても読めるときは、その選択肢を出す
+    Utf32 {
+        path: PathBuf,
+        name: &'static str,
+        as_utf16: Option<Enc>,
+    },
     Info(String),
 }
 
@@ -819,6 +978,8 @@ enum Action {
     ReloadNow(u64, Enc),
     /// 大きなファイルを確認のうえ開く
     OpenAnyway(PathBuf),
+    /// 文字コードを指定して (新しいタブで) 開く
+    OpenAs(PathBuf, Enc),
     DismissModal,
     /// 検索バーを開く (true なら置換の行も表示する)
     OpenFind(bool),
@@ -846,16 +1007,26 @@ struct ImeGuard {
     segs: Vec<ime::Segment>,
     /// 直近の Commit の時刻 (egui の time)
     last_commit: Option<f64>,
-    /// 直近の Commit の後に、まだ取り除ける Enter の数 (Commit のたびに 1 に戻る)。
+    /// 直近の Commit の後に、まだ取り除ける Enter の数 (Commit のたびに 1 に戻る。
+    /// 今の変換の間にすでに Enter を取り除いていたときは 0)。
     /// 確定の Enter は 1 回だけなので、猶予の間でも 2 回目以降の Enter は本物の改行として通す
     commit_enter_budget: u32,
     /// 最後の (空でない) Preedit の後に来た「空の Preedit / Disabled」の数。
     /// 最後の Preedit 以降に Commit が来ていれば None
     ends_since_preedit: Option<u32>,
+    /// 取り除いた Enter の押下が、まだ離されていない (Enter の離した通知 `pressed: false` が
+    /// まだ来ていない) とき、最後に取り除いた (または Commit が来た) 時刻。
+    /// 同じ物理的な 1 回の押下が、変換中の Enter と確定後の遅れた Enter の 2 つに分かれて
+    /// 届くことがあるため、離されるまで (猶予の間は) 続く Enter の押下も同じものとして取り除く。
+    /// 離した通知が来たら、その後の押下は本物の Enter として通す
+    enter_held_since: Option<f64>,
+    /// 今の変換の間に Enter の押下を取り除いたか
+    dropped_enter_in_composition: bool,
 }
 
 impl ImeGuard {
-    /// 確定の Enter が Commit の前後どちらに来ても取り除くための猶予 (秒)
+    /// 確定の Enter が Commit の前後どちらに来ても取り除くための猶予 (秒)。
+    /// Enter の離した通知が届かなかったときも、この時間が過ぎれば Enter を通す
     const GRACE: f64 = 0.05;
 
     /// 入力イベントを整える (確定の Enter と、偽の確定を取り除く)。
@@ -868,67 +1039,112 @@ impl ImeGuard {
     /// 偽の確定では、未確定文字列を消した通知 (空の Preedit か Disabled) がその前に
     /// もう 1 つ来る。そこで 2 つ以上来た後の Commit は捨て、空の Preedit に置き換える
     /// (TextEdit に未確定文字列が残っていれば、それを消すため)。
+    ///
+    /// 変換の取り消し: 変換中に Disabled が来たとき (取り消し)、egui は未確定文字列を
+    /// 本文へ挿入したまま残してしまう (Disabled は何も消さない)。そこで Disabled の直前に
+    /// 空の Preedit を挿入し、egui に未確定文字列を消させる。後から本物の Commit が来ても、
+    /// egui は消した位置 (カーソルが元の位置と同じ) へ確定文字列を挿入するので影響しない。
+    /// この挿入した空の Preedit は、上の偽の確定の判定には数えない。
     fn filter(&mut self, time: f64, events: &mut Vec<egui::Event>) {
-        for e in events.iter_mut() {
-            match e {
+        let mut out = Vec::with_capacity(events.len() + 1);
+        for e in events.drain(..) {
+            match &e {
                 // 新しい変換の開始: 前の変換の数え上げを持ち越さない
                 egui::Event::Ime(egui::ImeEvent::Enabled) => {
                     self.ends_since_preedit = None;
+                    self.dropped_enter_in_composition = false;
+                    out.push(e);
                 }
                 egui::Event::Ime(egui::ImeEvent::Preedit(t)) if !t.is_empty() => {
+                    if !self.composing {
+                        self.dropped_enter_in_composition = false;
+                    }
                     self.ends_since_preedit = Some(0);
+                    self.composing = true;
+                    self.preedit = t.clone();
+                    out.push(e);
                 }
-                egui::Event::Ime(egui::ImeEvent::Preedit(_) | egui::ImeEvent::Disabled) => {
+                egui::Event::Ime(egui::ImeEvent::Preedit(_)) => {
                     if let Some(n) = &mut self.ends_since_preedit {
                         *n += 1;
                     }
+                    self.composing = false;
+                    self.preedit.clear();
+                    out.push(e);
+                }
+                egui::Event::Ime(egui::ImeEvent::Disabled) => {
+                    if let Some(n) = &mut self.ends_since_preedit {
+                        *n += 1;
+                    }
+                    if self.composing {
+                        out.push(egui::Event::Ime(egui::ImeEvent::Preedit(String::new())));
+                    }
+                    self.composing = false;
+                    self.preedit.clear();
+                    out.push(e);
                 }
                 egui::Event::Ime(egui::ImeEvent::Commit(_)) => {
                     let fake = self.ends_since_preedit.is_some_and(|n| n >= 2);
                     self.ends_since_preedit = None;
+                    self.composing = false;
+                    self.preedit.clear();
                     if fake {
-                        *e = egui::Event::Ime(egui::ImeEvent::Preedit(String::new()));
+                        out.push(egui::Event::Ime(egui::ImeEvent::Preedit(String::new())));
+                    } else {
+                        self.last_commit = Some(time);
+                        // 今の変換の間に Enter を取り除いていれば、それが確定の Enter。
+                        // まだなら、確定の後に遅れて届く Enter を 1 回だけ取り除く
+                        self.commit_enter_budget = if self.dropped_enter_in_composition {
+                            0
+                        } else {
+                            1
+                        };
+                        self.dropped_enter_in_composition = false;
+                        if let Some(t) = &mut self.enter_held_since {
+                            *t = time; // 猶予は確定からの時間で数える
+                        }
+                        out.push(e);
                     }
                 }
-                _ => {}
+                egui::Event::Key {
+                    key: Key::Enter,
+                    pressed: false,
+                    ..
+                } => {
+                    // 離された: これ以降の押下は新しい押下
+                    self.enter_held_since = None;
+                    out.push(e);
+                }
+                egui::Event::Key {
+                    key: Key::Enter,
+                    pressed: true,
+                    ..
+                } => {
+                    if self.composing {
+                        self.dropped_enter_in_composition = true;
+                        self.enter_held_since = Some(time);
+                        continue;
+                    }
+                    // 取り除いた押下がまだ離されていない間 (猶予の間) の Enter は、同じ押下の続き
+                    if let Some(t) = self.enter_held_since {
+                        if time - t <= Self::GRACE {
+                            self.enter_held_since = Some(time);
+                            continue;
+                        }
+                        self.enter_held_since = None;
+                    }
+                    // 確定の直後 (猶予の間) の Enter は 1 回だけ取り除く。それ以降は本物の Enter
+                    let after_commit = self.last_commit.is_some_and(|c| time - c <= Self::GRACE);
+                    if after_commit && self.commit_enter_budget > 0 {
+                        self.commit_enter_budget -= 1;
+                        continue;
+                    }
+                    out.push(e);
+                }
+                _ => out.push(e),
             }
         }
-        events.retain(|e| match e {
-            egui::Event::Ime(egui::ImeEvent::Preedit(t)) => {
-                self.composing = !t.is_empty();
-                self.preedit = t.clone();
-                true
-            }
-            egui::Event::Ime(egui::ImeEvent::Commit(_)) => {
-                self.composing = false;
-                self.preedit.clear();
-                self.last_commit = Some(time);
-                self.commit_enter_budget = 1;
-                true
-            }
-            egui::Event::Ime(egui::ImeEvent::Disabled) => {
-                self.composing = false;
-                self.preedit.clear();
-                true
-            }
-            egui::Event::Key {
-                key: Key::Enter,
-                pressed: true,
-                ..
-            } => {
-                if self.composing {
-                    return false;
-                }
-                // 確定の直後 (猶予の間) の Enter は 1 回だけ取り除く。それ以降は本物の Enter
-                let after_commit = self.last_commit.is_some_and(|c| time - c <= Self::GRACE);
-                if after_commit && self.commit_enter_budget > 0 {
-                    self.commit_enter_budget -= 1;
-                    return false;
-                }
-                true
-            }
-            _ => true,
-        });
+        *events = out;
     }
 }
 
@@ -936,8 +1152,20 @@ impl ImeGuard {
 enum LoadKind {
     /// 新しいタブで開く
     Open,
-    /// 開いている文書を、文字コードを指定して読み直す
-    Reload { doc_id: u64 },
+    /// 開いている文書を、文字コードを指定して読み直す。
+    /// `generation` は読み込みを始めた時点の文書の世代 (`Doc::generation`)。
+    /// 読み込み中に文書が変わっていたら、結果は取り込まずに捨てる
+    Reload { doc_id: u64, generation: u64 },
+}
+
+/// 読み込みを頼んだ時点の、ユーザーの操作の状態。読み込みが終わったときに、
+/// その間にユーザーが別のタブへ移った・別の欄へフォーカスを移したのなら、
+/// 新しいタブを勝手に選択したり、フォーカスを奪ったりしないために使う
+struct LoadOrigin {
+    /// 選択していた文書
+    active_doc: Option<u64>,
+    /// フォーカスのあった欄
+    focus: Option<egui::Id>,
 }
 
 /// バックグラウンドのスレッドで実行中の読み込み
@@ -946,7 +1174,8 @@ struct PendingLoad {
     /// 同じファイルかどうかの判定用 (`fileio::path_key`)
     key: String,
     kind: LoadKind,
-    rx: mpsc::Receiver<Result<fileio::Loaded, String>>,
+    origin: LoadOrigin,
+    rx: mpsc::Receiver<Result<fileio::Loaded, fileio::LoadError>>,
 }
 
 /// 読み込みの結果を伝える状態表示 (デコードエラー・改行コードの混在)
@@ -969,7 +1198,9 @@ struct App {
     active: usize,
     next_id: u64,
     untitled_counter: usize,
-    modal: Option<Modal>,
+    /// 表示を待っている確認・お知らせ。先頭を表示し、新しいものは後ろへ足す
+    /// (保存の途中の確認が、別の通知で上書きされて続きの操作を失わないように)
+    modals: VecDeque<Modal>,
     status: String,
     font_size: f32,
     wrap: bool,
@@ -981,6 +1212,8 @@ struct App {
     focus_editor: bool,
     last_title: String,
     find: FindState,
+    /// このフレームの検索の現在位置 (件数の表示と強調で共有する)
+    find_pos: FindPos,
     /// 一致箇所を画面内にスクロールする要求 (文書id, 文字位置)。次の描画で処理する
     scroll_req: Option<(u64, usize)>,
     /// バックグラウンドスレッドから描画を促すために使う
@@ -989,6 +1222,9 @@ struct App {
     loads: Vec<PendingLoad>,
     /// タブの列をスクロールして見せ終わった、選択中の文書 (選択が変わったときだけスクロールする)
     tab_shown: Option<u64>,
+    /// 自動インデントが次のフレームへ持ち越した入力 (`apply_auto_indent`)。
+    /// 次のフレームの入力の先頭へ戻す
+    deferred_events: Vec<egui::Event>,
 }
 
 impl App {
@@ -1009,7 +1245,7 @@ impl App {
             active: 0,
             next_id: 1,
             untitled_counter: 0,
-            modal: None,
+            modals: VecDeque::new(),
             status: "準備完了".into(),
             font_size: 15.0,
             wrap: true,
@@ -1020,13 +1256,31 @@ impl App {
             focus_editor: true,
             last_title: String::new(),
             find: FindState::default(),
+            find_pos: FindPos::default(),
             scroll_req: None,
             ctx,
             loads: Vec::new(),
             tab_shown: None,
+            deferred_events: Vec::new(),
         };
         app.new_doc();
         app
+    }
+
+    /// 表示中 (先頭) の確認・お知らせ
+    #[cfg(test)]
+    fn modal(&self) -> Option<&Modal> {
+        self.modals.front()
+    }
+
+    /// 確認・お知らせを待ち行列の後ろへ足す
+    fn push_modal(&mut self, m: Modal) {
+        self.modals.push_back(m);
+    }
+
+    /// 表示中の確認・お知らせを閉じる (次のものがあれば、それが表示される)
+    fn pop_modal(&mut self) {
+        self.modals.pop_front();
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -1081,12 +1335,13 @@ impl App {
     }
 
     fn open_path(&mut self, path: PathBuf) {
-        self.open_path_checked(path, false);
+        self.open_path_checked(path, false, None);
     }
 
     /// ファイルを開く。既に開いている (または読み込み中の) ファイルなら、そのタブに切り替えるだけ。
-    /// 大きなファイルは `confirmed_large` でなければ、先に確認する
-    fn open_path_checked(&mut self, path: PathBuf, confirmed_large: bool) {
+    /// 大きなファイルは `confirmed_large` でなければ、先に確認する。
+    /// `forced` を指定すると、その文字コードで読む
+    fn open_path_checked(&mut self, path: PathBuf, confirmed_large: bool, forced: Option<Enc>) {
         let key = fileio::path_key(&path);
         if let Some(i) = self.find_doc_by_key(&key) {
             self.active = i;
@@ -1100,12 +1355,12 @@ impl App {
         if !confirmed_large {
             if let Ok(m) = std::fs::metadata(&path) {
                 if m.len() > fileio::LARGE_FILE_BYTES {
-                    self.modal = Some(Modal::ConfirmLargeOpen { path, size: m.len() });
+                    self.push_modal(Modal::ConfirmLargeOpen { path, size: m.len() });
                     return;
                 }
             }
         }
-        self.start_load(path, key, LoadKind::Open, None);
+        self.start_load(path, key, LoadKind::Open, forced);
     }
 
     /// 読み込みをバックグラウンドのスレッドで始める (読み込み中も他のタブを操作できる)
@@ -1120,7 +1375,7 @@ impl App {
                 ctx.request_repaint();
             });
         if let Err(e) = spawned {
-            self.modal = Some(Modal::Info(format!(
+            self.push_modal(Modal::Info(format!(
                 "ファイルを読み込めませんでした:\n{}\n\n{}",
                 path.display(),
                 e
@@ -1132,15 +1387,23 @@ impl App {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
         self.status = format!("読み込み中… {name}");
+        let origin = LoadOrigin {
+            active_doc: self.docs.get(self.active).map(|d| d.id),
+            focus: self.ctx.memory(|m| m.focused()),
+        };
         self.loads.push(PendingLoad {
             path,
             key,
             kind,
+            origin,
             rx,
         });
     }
 
-    /// 終わった読み込みを取り込む (毎フレーム呼ぶ)
+    /// 終わった読み込みを取り込む。
+    ///
+    /// 毎フレームの最後 (編集欄の処理の後) に呼ぶ。フレームの最初に呼ぶと、同じフレームの
+    /// 入力 (キー入力・Ctrl+S など) が、取り込みで切り替わった新しいタブへ届いてしまう
     fn poll_loads(&mut self, ctx: &egui::Context) {
         let mut finished = Vec::new();
         let mut i = 0;
@@ -1150,87 +1413,151 @@ impl App {
                 Ok(r) => finished.push((self.loads.remove(i), r)),
                 Err(mpsc::TryRecvError::Disconnected) => finished.push((
                     self.loads.remove(i),
-                    Err("読み込みが中断されました".to_string()),
+                    Err(fileio::LoadError::Message("読み込みが中断されました".into())),
                 )),
             }
+        }
+        if !finished.is_empty() {
+            ctx.request_repaint(); // 取り込んだ結果を、次のフレームで画面に出す
         }
         for (l, r) in finished {
             self.finish_load(ctx, l, r);
         }
     }
 
+    /// 読み込みを頼んでから、ユーザーが選択中のタブ・フォーカスを変えていないか
+    fn user_unchanged_since(&self, ctx: &egui::Context, o: &LoadOrigin) -> bool {
+        let active = self.docs.get(self.active).map(|d| d.id);
+        if active != o.active_doc {
+            return false;
+        }
+        let focus = ctx.memory(|m| m.focused());
+        // 起動直後などフォーカスが無かったところから、選択中の編集欄へ移っただけなら、
+        // ユーザーが変えたのではない
+        focus == o.focus
+            || (o.focus.is_none() && active.is_some_and(|id| focus == Some(editor_id(id))))
+    }
+
     fn finish_load(
         &mut self,
         ctx: &egui::Context,
         l: PendingLoad,
-        result: Result<fileio::Loaded, String>,
+        result: Result<fileio::Loaded, fileio::LoadError>,
     ) {
-        let PendingLoad { path, key, kind, .. } = l;
+        let PendingLoad {
+            path,
+            key,
+            kind,
+            origin,
+            ..
+        } = l;
+        // 選択・フォーカスを動かしてよいのは、ユーザーが読み込みの間に何も変えていないときだけ
+        let follow = self.user_unchanged_since(ctx, &origin);
         match (kind, result) {
+            (LoadKind::Open, Err(fileio::LoadError::Utf32 { name, as_utf16 })) => {
+                self.push_modal(Modal::Utf32 {
+                    path,
+                    name,
+                    as_utf16,
+                });
+            }
             (LoadKind::Open, Err(e)) => {
-                self.modal = Some(Modal::Info(format!(
+                self.push_modal(Modal::Info(format!(
                     "ファイルを開けませんでした:\n{}\n\n{}",
                     path.display(),
-                    e
+                    e.message()
                 )));
             }
             (LoadKind::Reload { .. }, Err(e)) => {
-                self.modal = Some(Modal::Info(format!(
+                self.push_modal(Modal::Info(format!(
                     "読み直せませんでした (文書はそのままです):\n{}\n\n{}",
                     path.display(),
-                    e
+                    e.message()
                 )));
             }
             (LoadKind::Open, Ok(loaded)) => {
                 // 読み込み中に、別の経路 (名前を付けて保存など) で同じファイルが開かれていたら切り替えるだけ
                 if let Some(i) = self.find_doc_by_key(&key) {
-                    self.active = i;
-                    self.focus_editor = true;
+                    if follow {
+                        self.active = i;
+                        self.focus_editor = true;
+                    }
                     return;
                 }
                 let notes = load_notes(loaded.lossy, loaded.mixed_eol, loaded.eol);
                 let id = self.alloc_id();
                 let doc = Doc::from_loaded(id, path, loaded);
-                self.status = format!(
-                    "{} を開きました ({} / {}){}",
-                    doc.title(),
-                    doc.enc.label(),
-                    doc.eol.label(),
-                    notes
-                );
+                // Undo 履歴の件数を、本文の大きさに合わせる
+                reset_editor_state(ctx, editor_id(id), doc.text.len());
+                self.status = if follow {
+                    format!(
+                        "{} を開きました ({} / {}){}",
+                        doc.title(),
+                        doc.enc.label(),
+                        doc.eol.label(),
+                        notes
+                    )
+                } else {
+                    format!(
+                        "「{}」を開きました ({} / {}){}",
+                        doc.title(),
+                        doc.enc.label(),
+                        doc.eol.label(),
+                        notes
+                    )
+                };
                 // 未編集の空タブ1つだけなら置き換える
                 let replace = self.docs.len() == 1
                     && self.docs[0].path.is_none()
                     && !self.docs[0].dirty
                     && self.docs[0].text.is_empty();
                 if replace {
+                    forget_editor_state(ctx, editor_id(self.docs[0].id));
                     self.docs[0] = doc;
                     self.active = 0;
                 } else {
                     self.docs.push(doc);
-                    self.active = self.docs.len() - 1;
+                    if follow {
+                        self.active = self.docs.len() - 1;
+                    }
                 }
-                self.focus_editor = true;
+                if follow {
+                    self.focus_editor = true;
+                }
             }
-            (LoadKind::Reload { doc_id }, Ok(loaded)) => {
+            (LoadKind::Reload { doc_id, generation }, Ok(loaded)) => {
                 let Some(i) = self.index_of(doc_id) else {
                     return; // 読み込み中にタブが閉じられた
                 };
-                let notes = load_notes(loaded.lossy, loaded.mixed_eol, loaded.eol);
+                // 読み込みを始めてから、文書が変わっていたら (編集・保存・保存先の変更・
+                // 文字コードや改行コードの変更) 結果は捨てる。取り込むと、新しい編集が
+                // Undo もできずに消えたり、別の保存先の文書に古い内容が入ったりする
                 let d = &mut self.docs[i];
+                let same_path = d
+                    .path
+                    .as_deref()
+                    .is_some_and(|p| fileio::path_key(p) == key);
+                if d.generation != generation || !same_path {
+                    self.status = "読み込み中に変更されたため、開き直しを中止しました".into();
+                    return;
+                }
+                let notes = load_notes(loaded.lossy, loaded.mixed_eol, loaded.eol);
                 d.text = loaded.text;
                 d.enc = loaded.enc;
                 d.eol = loaded.eol;
                 d.lossy_load = loaded.lossy;
+                d.mixed_eol = loaded.mixed_eol;
                 d.fingerprint = loaded.fingerprint;
                 d.mark_saved();
-                d.rev += 1;
+                d.edited();
                 d.cursor_idx = 0;
                 d.line_col = (1, 1);
                 // 読み直す前の Undo 履歴で、別の内容に戻ってしまわないようにする
-                reset_editor_state(ctx, editor_id(d.id));
+                reset_editor_state(ctx, editor_id(d.id), d.text.len());
                 self.status = format!("{} として再読み込みしました{}", d.enc.label(), notes);
-                self.focus_editor = true;
+                if follow && self.docs[self.active].id == doc_id {
+                    self.focus_editor = true;
+                }
             }
         }
     }
@@ -1294,7 +1621,6 @@ impl App {
     /// 未保存の文書をすべて保存して終了する。確認の画面で止まったときは、
     /// その確認に答えた後で (`Then::SaveAll`) ここへ戻って続きを行う
     fn save_all_and_exit(&mut self, ctx: &egui::Context) {
-        self.modal = None;
         let mut i = 0;
         while i < self.docs.len() {
             if self.docs[i].dirty {
@@ -1310,7 +1636,12 @@ impl App {
     }
 
     /// 文書を `path` に保存する。各種の確認 (`ok` で答え済みのものは省く) が必要なら、
-    /// 確認の画面を設定して false を返す。保存できたら true
+    /// 確認の画面を設定して false を返す。保存できたら true。
+    ///
+    /// 失敗しうる準備 (文字コードの変換・画面の文字を保存内容にそろえるための複製) は、
+    /// ディスクへ書く前にすべて済ませる。書いた後は失敗しない処理だけにして、
+    /// 「ファイルは書けたのに画面が食い違ったまま、保存成功として閉じる・終了する」ことが
+    /// ないようにする
     fn write_doc(
         &mut self,
         ctx: &egui::Context,
@@ -1331,7 +1662,7 @@ impl App {
             .iter()
             .any(|l| matches!(l.kind, LoadKind::Open) && l.key == key);
         if open_elsewhere {
-            self.modal = Some(Modal::Info(format!(
+            self.modals.push_back(Modal::Info(format!(
                 "そのファイルは別のタブで開いています:\n{}",
                 path.display()
             )));
@@ -1346,7 +1677,7 @@ impl App {
             .is_some_and(|p| fileio::path_key(p) == key);
         // 元のファイルへの上書きでは、デコードできなかったバイトが失われる
         if same_file && d.lossy_load && !ok.lossy_load {
-            self.modal = Some(Modal::LossyLoad {
+            self.modals.push_back(Modal::LossyLoad {
                 id,
                 path,
                 then,
@@ -1354,25 +1685,50 @@ impl App {
             });
             return false;
         }
-        // 読み込み後に、他のプログラムがファイルを変更・削除していないか
-        if same_file && !ok.conflict {
-            if let Some(fp) = &d.fingerprint {
-                if fileio::changed_since(fp, &path) {
-                    self.modal = Some(Modal::Conflict {
+        // 保存先が、ユーザーが承知した状態のままか。
+        // - 外部の変更を承知した (`ok.conflict`) なら、そのとき見せた状態のまま
+        // - 開いたファイルへの上書きなら、読み込んだときの状態のまま
+        // - それ以外 (新規・名前を付けて保存) は、いま見えている状態のまま
+        //   (保存先が無ければ、書くまでの間に作られていないこと)
+        // 違っていれば確認し直す。実際に置き換える直前にも `atomic_write` が確かめる
+        let current = fileio::fingerprint(&path);
+        let expect = match (&ok.conflict, same_file, &d.fingerprint) {
+            (Some(seen), _, _) => {
+                if *seen != current {
+                    self.modals.push_back(Modal::Conflict {
+                        id,
+                        path,
+                        then,
+                        ok: Confirmed {
+                            conflict: None,
+                            ..ok
+                        },
+                        seen: current,
+                    });
+                    return false;
+                }
+                fileio::Expect::Is(seen.clone())
+            }
+            (None, true, Some(fp)) => {
+                if current.as_ref() != Some(fp) {
+                    self.modals.push_back(Modal::Conflict {
                         id,
                         path,
                         then,
                         ok,
+                        seen: current,
                     });
                     return false;
                 }
+                fileio::Expect::Is(Some(fp.clone()))
             }
-        }
+            _ => fileio::Expect::Is(current),
+        };
         let out = encoding::apply_eol(&d.text, d.eol);
         let (bytes, lossy) = encoding::encode(&out, d.enc);
         drop(out);
         if lossy && !ok.lossy {
-            self.modal = Some(Modal::Lossy {
+            self.modals.push_back(Modal::Lossy {
                 id,
                 path,
                 then,
@@ -1381,45 +1737,73 @@ impl App {
             });
             return false;
         }
-        if let Err(e) = fileio::atomic_write(&path, &bytes) {
-            // 元のファイルはそのまま。変更ありのままにする
-            self.modal = Some(Modal::Info(format!(
-                "保存に失敗しました:\n{}\n\n{}",
-                path.display(),
-                e
-            )));
-            return false;
-        }
-
-        let d = &mut self.docs[idx];
-        d.path = Some(path.clone());
-        d.fingerprint = fileio::fingerprint(&path);
-        d.lossy_load = false;
-        let mut note = String::new();
-        let mut in_sync = true;
-        if lossy {
-            // 画面の文字を、実際に書き込んだ内容 (開き直したときに見える文字) にそろえる。
-            // 履歴に積むので、Ctrl+Z で元の文字に戻せる
+        // 画面の文字を、実際に書き込む内容 (開き直したときに見える文字) にそろえる準備。
+        // 履歴に積むので、Ctrl+Z で元の文字に戻せる。準備ができなければ保存しない
+        let prepared = if lossy {
             let (back, _) = encoding::decode(&bytes, d.enc);
             let back = encoding::normalize_eol(back);
             if back != d.text {
                 let cur = d.cursor_idx.min(back.chars().count());
-                if replace_text_with_undo(ctx, editor_id(d.id), &mut d.text, back, (cur, cur)) {
-                    d.rev += 1;
-                    d.cursor_idx = cur;
-                    d.line_col = line_col(&d.text, cur);
-                    note = " ※一部の文字は保存形式に合わせて変わりました (Ctrl+Z で戻せます)".into();
-                } else {
-                    in_sync = false;
-                    note = " ※メモリが足りず、画面の文字を保存内容にそろえられませんでした".into();
+                match prepare_replace(ctx, editor_id(id), &d.text, back, (cur, cur)) {
+                    Some(p) => Some((p, cur)),
+                    None => {
+                        self.modals.push_back(Modal::Info(format!(
+                            "メモリが足りないため、保存できませんでした:\n{}\n\n\
+                             (文書も、保存先のファイルも変更していません)",
+                            path.display()
+                        )));
+                        return false;
+                    }
                 }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        match fileio::atomic_write(&path, &bytes, &expect) {
+            Ok(()) => {}
+            Err(fileio::WriteError::Conflict) => {
+                // 確認してから書くまでの間に、保存先がまた変わった。何も書き換えていない
+                self.modals.push_back(Modal::Conflict {
+                    id,
+                    path: path.clone(),
+                    then,
+                    ok: Confirmed {
+                        conflict: None,
+                        ..ok
+                    },
+                    seen: fileio::fingerprint(&path),
+                });
+                return false;
+            }
+            Err(fileio::WriteError::Failed(e)) => {
+                // 元のファイルはそのまま。変更ありのままにする
+                self.modals.push_back(Modal::Info(format!(
+                    "保存に失敗しました:\n{}\n\n{}",
+                    path.display(),
+                    e
+                )));
+                return false;
             }
         }
-        if in_sync {
-            d.mark_saved();
-        } else {
-            d.dirty = true;
+
+        // ここから先は失敗しない処理だけ
+        let d = &mut self.docs[idx];
+        d.path = Some(path.clone());
+        d.fingerprint = fileio::fingerprint(&path);
+        d.lossy_load = false;
+        d.mixed_eol = false;
+        let mut note = String::new();
+        if let Some((p, cur)) = prepared {
+            p.apply(ctx, editor_id(d.id), &mut d.text);
+            d.edited();
+            d.cursor_idx = cur;
+            d.line_col = line_col(&d.text, cur);
+            note = " ※一部の文字は保存形式に合わせて変わりました (Ctrl+Z で戻せます)".into();
         }
+        d.meta_changed();
+        d.mark_saved();
         self.status = format!(
             "{} を保存しました ({} / {}){}",
             d.title(),
@@ -1433,13 +1817,15 @@ impl App {
     fn request_close(&mut self, idx: usize) {
         if self.docs[idx].dirty {
             self.active = idx;
-            self.modal = Some(Modal::ConfirmClose(self.docs[idx].id));
+            self.push_modal(Modal::ConfirmClose(self.docs[idx].id));
         } else {
             self.close_now(idx);
         }
     }
 
     fn close_now(&mut self, idx: usize) {
+        // 閉じた文書の編集欄の状態 (Undo 履歴を含む) を、egui の記憶から取り除く
+        forget_editor_state(&self.ctx, editor_id(self.docs[idx].id));
         self.docs.remove(idx);
         if self.docs.is_empty() {
             self.new_doc();
@@ -1460,7 +1846,8 @@ impl App {
             return;
         }
         if d.dirty {
-            self.modal = Some(Modal::ConfirmReload { id: d.id, enc });
+            let id = d.id;
+            self.push_modal(Modal::ConfirmReload { id, enc });
         } else {
             self.start_reload(d.id, enc);
         }
@@ -1477,13 +1864,22 @@ impl App {
         let pending = self
             .loads
             .iter()
-            .any(|l| matches!(l.kind, LoadKind::Reload { doc_id } if doc_id == id));
+            .any(|l| matches!(l.kind, LoadKind::Reload { doc_id, .. } if doc_id == id));
         if pending {
             self.status = "読み込み中です".into();
             return;
         }
         let key = fileio::path_key(&path);
-        self.start_load(path, key, LoadKind::Reload { doc_id: id }, Some(enc));
+        let generation = self.docs[i].generation;
+        self.start_load(
+            path,
+            key,
+            LoadKind::Reload {
+                doc_id: id,
+                generation,
+            },
+            Some(enc),
+        );
     }
 
     /// 保存時の文字コードを変更する (文字コード変換)
@@ -1495,6 +1891,7 @@ impl App {
         let from = d.enc.label();
         let (_, lossy) = encoding::encode(&d.text, enc);
         d.enc = enc;
+        d.meta_changed();
         d.update_dirty();
         self.status = if lossy {
             format!(
@@ -1515,6 +1912,7 @@ impl App {
         let d = &mut self.docs[self.active];
         if d.eol != eol {
             d.eol = eol;
+            d.meta_changed();
             d.update_dirty();
             self.status = format!(
                 "改行コードを {} に変更しました。保存すると反映されます",
@@ -1543,7 +1941,9 @@ impl App {
         self.find.focus_query = true;
     }
 
-    /// 次 (forward) / 前の一致を選択し、画面内にスクロールする
+    /// 次 (forward) / 前の一致を選択し、画面内にスクロールする。
+    ///
+    /// カーソル位置から文書を直接探す (一致の一覧が上限で打ち切られていても使える)
     fn find_jump(&mut self, ctx: &egui::Context, forward: bool) {
         if self.find.query.is_empty() {
             self.open_find(ctx, false);
@@ -1551,28 +1951,40 @@ impl App {
             return;
         }
         let cs = self.find.case_sensitive;
+        let query = self.find.query.clone();
         let d = &mut self.docs[self.active];
-        d.ensure_matches(&self.find.query, cs);
         let id = editor_id(d.id);
         let (cur_s, cur_e) = editor_sel(ctx, id).unwrap_or((d.cursor_idx, d.cursor_idx));
-        let matches = d.matches();
-        let picked = if forward {
-            search::next_index(matches, cur_e)
+        let found = if forward {
+            search::find_next(&d.text, &query, cs, search::char_to_byte(&d.text, cur_e))
         } else {
-            search::prev_index(matches, cur_s)
+            search::find_prev(&d.text, &query, cs, search::char_to_byte(&d.text, cur_s))
         };
-        let Some(i) = picked else {
+        let Some((bs, be)) = found else {
             self.status = "見つかりません".into();
             return;
         };
-        let (s, e) = matches[i];
-        let total = matches.len();
+        let s = search::byte_to_char(&d.text, bs);
+        let e = s + d.text[bs..be].chars().count();
         let doc_id = d.id;
         d.cursor_idx = e;
         d.line_col = line_col(&d.text, e);
+        // 何件目かは、覚えている一覧から求める (上限を超える一致は番号を出さない)
+        d.ensure_matches(&query, cs);
+        let capped = d.find_cache.as_ref().is_some_and(|c| c.capped);
+        let nth = search::exact_index(d.matches(), s, e);
+        let total = d.matches().len();
         set_editor_sel(ctx, id, s, e);
         self.scroll_req = Some((doc_id, s));
-        self.status = format!("{} 件中 {} 件目を選択しました", total, i + 1);
+        self.status = match (nth, capped) {
+            (Some(i), false) => format!("{} 件中 {} 件目を選択しました", total, i + 1),
+            (Some(i), true) => format!(
+                "{} 件目を選択しました ({} 件以上)",
+                i + 1,
+                with_commas(search::MAX_STORED_MATCHES)
+            ),
+            (None, _) => "一致を選択しました".into(),
+        };
         ctx.request_repaint();
     }
 
@@ -1589,12 +2001,16 @@ impl App {
         d.ensure_matches(&query, cs);
         let id = editor_id(d.id);
         let (sel_s, sel_e) = editor_sel(ctx, id).unwrap_or((d.cursor_idx, d.cursor_idx));
-        if !d.matches().contains(&(sel_s, sel_e)) {
+        let bs = search::char_to_byte(&d.text, sel_s);
+        let be = search::char_to_byte(&d.text, sel_e);
+        // 一覧にある一致か。一覧が上限で打ち切られているときは、選択そのものが一致かも調べる
+        let capped = d.find_cache.as_ref().is_some_and(|c| c.capped);
+        let is_match = search::exact_index(d.matches(), sel_s, sel_e).is_some()
+            || (capped && search::is_exact_match(&d.text, bs, be, &query, cs));
+        if !is_match {
             self.find_jump(ctx, true);
             return;
         }
-        let bs = search::char_to_byte(&d.text, sel_s);
-        let be = search::char_to_byte(&d.text, sel_e);
         let new_text = match search::replace_ranges(
             &d.text,
             &[(bs, be)],
@@ -1603,22 +2019,24 @@ impl App {
         ) {
             Ok(t) => t,
             Err(e) => {
-                self.modal = Some(Modal::Info(replace_error_message(&e)));
+                self.push_modal(Modal::Info(replace_error_message(&e)));
                 return;
             }
         };
         let cur = sel_s + repl.chars().count();
         // 置換後の本文で次の一致を探し、それを選択した状態にする
-        let new_matches = search::find_all(&new_text, &query, cs);
-        let next = search::next_index(&new_matches, cur).map(|i| new_matches[i]);
+        let next = search::find_next(&new_text, &query, cs, bs + repl.len()).map(|(nb, ne)| {
+            let ts = search::byte_to_char(&new_text, nb);
+            (ts, ts + new_text[nb..ne].chars().count())
+        });
         let (ts, te) = next.unwrap_or((cur, cur));
         if !replace_text_with_undo(ctx, id, &mut d.text, new_text, (ts, te)) {
-            self.modal = Some(Modal::Info(replace_error_message(
+            self.push_modal(Modal::Info(replace_error_message(
                 &search::ReplaceError::OutOfMemory,
             )));
             return;
         }
-        d.rev += 1;
+        d.edited();
         d.update_dirty();
         d.cursor_idx = te;
         d.line_col = line_col(&d.text, te);
@@ -1636,7 +2054,10 @@ impl App {
         ctx.request_repaint();
     }
 
-    /// すべての一致を置換する
+    /// すべての一致を置換する。
+    ///
+    /// 一致の一覧は使わず、文書を 2 回走査する (1 回目は件数と置換後の大きさだけを数え、
+    /// 上限を超えるときは何も作らずに断る。2 回目で結果を組み立てる)
     fn replace_all_matches(&mut self, ctx: &egui::Context) {
         if self.find.query.is_empty() {
             self.status = "検索語を入力してください".into();
@@ -1645,36 +2066,31 @@ impl App {
         let cs = self.find.case_sensitive;
         let (query, repl) = (self.find.query.clone(), self.find.replacement.clone());
         let d = &mut self.docs[self.active];
-        d.ensure_matches(&query, cs);
-        let Some(cache) = d.find_cache.as_ref() else {
-            return;
+        let (new_text, n) = match search::replace_all_streaming(
+            &d.text,
+            &query,
+            &repl,
+            cs,
+            search::MAX_REPLACE_RESULT,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                self.push_modal(Modal::Info(replace_error_message(&e)));
+                return;
+            }
         };
-        let n = cache.byte_ranges.len();
         if n == 0 {
             self.status = "見つかりません".into();
             return;
         }
-        // 置換後の大きさを先に計算し、上限を超えるときは何も複製せずに断る
-        let new_text = match search::replace_ranges(
-            &d.text,
-            &cache.byte_ranges,
-            &repl,
-            search::MAX_REPLACE_RESULT,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                self.modal = Some(Modal::Info(replace_error_message(&e)));
-                return;
-            }
-        };
         let cur = d.cursor_idx.min(new_text.chars().count());
         if !replace_text_with_undo(ctx, editor_id(d.id), &mut d.text, new_text, (cur, cur)) {
-            self.modal = Some(Modal::Info(replace_error_message(
+            self.push_modal(Modal::Info(replace_error_message(
                 &search::ReplaceError::OutOfMemory,
             )));
             return;
         }
-        d.rev += 1;
+        d.edited();
         d.update_dirty();
         d.cursor_idx = cur;
         d.line_col = line_col(&d.text, cur);
@@ -1727,20 +2143,23 @@ impl App {
             Action::Convert(e) => self.convert_to(e),
             Action::SetEol(e) => self.set_eol(e),
             Action::SaveAndClose(id) => {
-                self.modal = None;
+                self.pop_modal();
                 if let Some(i) = self.index_of(id) {
                     self.save_then(ctx, i, false, Then::Close(id));
                 }
             }
             Action::DiscardAndClose(id) => {
-                self.modal = None;
+                self.pop_modal();
                 if let Some(i) = self.index_of(id) {
                     self.close_now(i);
                 }
             }
-            Action::SaveAllAndExit => self.save_all_and_exit(ctx),
+            Action::SaveAllAndExit => {
+                self.pop_modal();
+                self.save_all_and_exit(ctx);
+            }
             Action::ExitNow => {
-                self.modal = None;
+                self.pop_modal();
                 self.allow_exit = true;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
@@ -1750,7 +2169,7 @@ impl App {
                 then,
                 ok,
             } => {
-                self.modal = None;
+                self.pop_modal();
                 if let Some(i) = self.index_of(id) {
                     if self.write_doc(ctx, i, path, then, ok) {
                         self.resume(ctx, then);
@@ -1758,20 +2177,24 @@ impl App {
                 }
             }
             Action::SaveAsFor(id, then) => {
-                self.modal = None;
+                self.pop_modal();
                 if let Some(i) = self.index_of(id) {
                     self.save_then(ctx, i, true, then);
                 }
             }
             Action::ReloadNow(id, enc) => {
-                self.modal = None;
+                self.pop_modal();
                 self.start_reload(id, enc);
             }
             Action::OpenAnyway(path) => {
-                self.modal = None;
-                self.open_path_checked(path, true);
+                self.pop_modal();
+                self.open_path_checked(path, true, None);
             }
-            Action::DismissModal => self.modal = None,
+            Action::OpenAs(path, enc) => {
+                self.pop_modal();
+                self.open_path_checked(path, true, Some(enc));
+            }
+            Action::DismissModal => self.pop_modal(),
         }
     }
 
@@ -2005,19 +2428,19 @@ impl App {
             }
         }
 
-        // 件数の表示 (文書の検索結果キャッシュを使う)
+        // 件数の表示 (文書の検索結果キャッシュと、このフレームの現在位置を使う)
         let has_query = !self.find.query.is_empty();
         let label = if has_query {
-            let cs = self.find.case_sensitive;
-            let d = &mut self.docs[self.active];
-            d.ensure_matches(&self.find.query, cs);
+            let d = &self.docs[self.active];
+            let capped = d.find_cache.as_ref().is_some_and(|c| c.capped);
             let matches = d.matches();
             if matches.is_empty() {
                 "見つかりません".to_owned()
+            } else if capped {
+                // 上限を超える一致は数えない
+                format!("{} 件以上", with_commas(search::MAX_STORED_MATCHES))
             } else {
-                let (s, e) =
-                    editor_sel(ui.ctx(), editor_id(d.id)).unwrap_or((d.cursor_idx, d.cursor_idx));
-                let cur = search::current_index(matches, s, e).unwrap_or(0);
+                let cur = self.find_pos.current.unwrap_or(0);
                 format!("{} 件中 {} 件目", matches.len(), cur + 1)
             }
         } else {
@@ -2082,6 +2505,15 @@ impl App {
                 ui.separator();
                 ui.label(d.eol.label());
                 ui.separator();
+                if d.mixed_eol {
+                    // 読み込み時の改行コードの混在は、保存して統一するまで表示し続ける
+                    // (状態表示は他のタブの読み込みなどで書き換わるため)
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!("改行混在 → {} で保存", d.eol.label()),
+                    );
+                    ui.separator();
+                }
                 ui.label(format!("{} 文字", chars));
                 ui.separator();
                 ui.label(format!("{} 行, {} 列", d.line_col.0, d.line_col.1));
@@ -2109,7 +2541,12 @@ impl App {
         }
         // 自動インデント付きの改行 (egui の TextEdit が処理する前に Enter を取り除いて挿入する)
         if auto_indent && !composing {
-            apply_auto_indent(ui.ctx(), id, &d.text);
+            let deferred = apply_auto_indent(ui.ctx(), id, &d.text);
+            if !deferred.is_empty() {
+                // 本文を書き換える入力の後ろの Enter は、次のフレームで (更新後の本文で) 処理する
+                self.deferred_events = deferred;
+                ui.ctx().request_repaint();
+            }
         }
         if find_on {
             // 文書や検索語が変わったときだけ一致を数え直す
@@ -2117,12 +2554,10 @@ impl App {
         }
         // 行数は版が変わったときだけ数え直す
         let (_, line_count) = d.stats();
-        let rev = d.rev;
         // 以降は欄ごとに独立して借りる (本文を TextEdit に渡しながら、キャッシュも更新するため)
         let Doc {
             text,
             find_cache,
-            layout_cache,
             row_lines,
             cursor_idx,
             line_col: line_col_pos,
@@ -2131,11 +2566,10 @@ impl App {
         } = &mut *d;
         let doc_id = *doc_id;
         let find_cache = if find_on { find_cache.as_ref() } else { None };
-        let matches: &[(usize, usize)] = find_cache.map_or(&[], |c| c.matches.as_slice());
         let byte_ranges: &[(usize, usize)] = find_cache.map_or(&[], |c| c.byte_ranges.as_slice());
-        let find_stamp = find_cache.map_or(0, |c| c.stamp);
         // 選択がちょうど一致箇所と同じなら、それを「現在の一致」として濃く表示する
-        let exact = editor_sel(ui.ctx(), id).and_then(|sel| matches.iter().position(|&m| m == sel));
+        // (このフレームの最初に求めた値。件数の表示と共有する)
+        let exact = if find_on { self.find_pos.exact } else { None };
         let colors = match_colors(dark);
 
         // 行番号の桁数 (行数は改行の数から求める)
@@ -2168,30 +2602,18 @@ impl App {
                     // この描画で何回目のレイアウトか。egui の TextEdit は、描画の最初に 1 回
                     // (編集前の本文で) レイアウトし、入力で本文が変わった場合だけもう一度
                     // (編集後の本文で) レイアウトする。版番号 (rev) は描画の後で上げるので、
-                    // キャッシュを使えるのは 1 回目だけ。2 回目は本文が変わっているため、
-                    // キャッシュの読み書きも検索結果 (古い位置) の強調もしない
+                    // 検索結果 (編集前の本文の位置) の強調ができるのは 1 回目だけ。
+                    // 2 回目は本文が変わっているため、強調しない。
+                    //
+                    // 結果 (galley) は自前で使い回さず、毎回 egui の `Fonts::layout_job` に任せる。
+                    // egui は文字の描画用の画像 (フォントアトラス) を作り直すことがあり、その後は
+                    // 古い galley の文字の位置情報が無効になる。egui 自身のキャッシュは
+                    // それを考慮しているので、そちらに任せる
                     let calls = std::cell::Cell::new(0u32);
                     let mut layouter = |ui: &egui::Ui, s: &str, wrap_width: f32| {
                         let first = calls.get() == 0;
                         calls.set(calls.get() + 1);
                         let text_color = ui.visuals().text_color();
-                        let key = LayoutKey {
-                            rev,
-                            wrap_width: if wrap { wrap_width.to_bits() } else { 0 },
-                            font_size: font.size.to_bits(),
-                            text_color,
-                            dark,
-                            pixels_per_point: ui.ctx().pixels_per_point().to_bits(),
-                            find_stamp,
-                            exact,
-                        };
-                        if first {
-                            if let Some(c) = layout_cache.as_ref() {
-                                if c.key == key {
-                                    return c.galley.clone();
-                                }
-                            }
-                        }
                         let mut job = egui::text::LayoutJob::simple(
                             s.to_owned(),
                             font.clone(),
@@ -2206,14 +2628,7 @@ impl App {
                                 job.sections = sections;
                             }
                         }
-                        let galley = ui.fonts(|f| f.layout_job(job));
-                        if first {
-                            *layout_cache = Some(LayoutCache {
-                                key,
-                                galley: galley.clone(),
-                            });
-                        }
-                        galley
+                        ui.fonts(|f| f.layout_job(job))
                     };
                     let old_fill = hide_selection_fill(ui, composing);
                     let fill_slot = reserve_preedit_slot(ui);
@@ -2294,11 +2709,24 @@ impl App {
         if changed {
             // 版を上げ、保存済みの内容と比べて変更あり (dirty) を更新する。
             // キャッシュは版で判定するので、次の描画で作り直される
-            d.rev += 1;
+            d.edited();
             d.update_dirty();
             ui.ctx().request_repaint();
         }
     }
+}
+
+/// 3 桁ごとにカンマで区切った数 (例: 100000 → "100,000")
+fn with_commas(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// 置換できなかった理由の説明
@@ -2318,10 +2746,10 @@ fn replace_error_message(e: &search::ReplaceError) -> String {
 
 /// galley の各表示行の論理行番号。galley が変わったときだけ作り直す
 fn row_lines_for<'a>(cache: &'a mut Option<RowLines>, galley: &Arc<egui::Galley>) -> &'a [u32] {
-    let fresh = matches!(cache, Some(c) if Arc::ptr_eq(&c.galley, galley));
+    let fresh = matches!(cache, Some(c) if Weak::ptr_eq(&c.galley, &Arc::downgrade(galley)));
     if !fresh {
         *cache = Some(RowLines {
-            galley: galley.clone(),
+            galley: Arc::downgrade(galley),
             lines: row_line_numbers(galley.rows.iter().map(|r| r.ends_with_newline)),
         });
     }
@@ -2361,6 +2789,12 @@ impl eframe::App for App {
         let time = raw_input.time.unwrap_or(0.0);
         self.ime_guard.filter(time, &mut raw_input.events);
         normalize_text_events(&mut raw_input.events);
+        // 前のフレームで持ち越した入力 (自動インデントの Enter など) を先頭へ戻す。
+        // すでに ImeGuard を通っているので、もう一度は通さない
+        if !self.deferred_events.is_empty() {
+            let deferred = std::mem::take(&mut self.deferred_events);
+            raw_input.events.splice(0..0, deferred);
+        }
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -2377,16 +2811,38 @@ impl App {
     /// 1 フレーム分の画面の更新。`hwnd` は IME の文節の取得に使うウィンドウハンドル
     /// (取得できなければ 0)。eframe に依存しないので、テストから直接呼べる
     fn update_ui(&mut self, ctx: &egui::Context, hwnd: isize) {
+        self.update_ui_with(ctx, hwnd, Vec::new());
+    }
+
+    /// このフレームの検索の現在位置を求める (選択範囲から 1 回だけ。件数の表示と、
+    /// 現在の一致の強調で共有する。一覧は昇順なので二分探索)
+    fn update_find_pos(&mut self, ctx: &egui::Context) {
+        self.find_pos = FindPos::default();
+        if !self.find.open || self.find.query.is_empty() {
+            return;
+        }
+        let cs = self.find.case_sensitive;
+        self.docs[self.active].ensure_matches(&self.find.query, cs);
+        let d = &self.docs[self.active];
+        let (s, e) = editor_sel(ctx, editor_id(d.id)).unwrap_or((d.cursor_idx, d.cursor_idx));
+        let m = d.matches();
+        let exact = search::exact_index(m, s, e);
+        self.find_pos = FindPos {
+            exact,
+            current: exact.or_else(|| search::next_index(m, e)),
+        };
+    }
+
+    /// `update_ui` の本体。`extra` は、画面の操作のほかに、このフレームで実行する操作
+    /// (テストで、ボタンを押したのと同じ状況を作るために使う)
+    fn update_ui_with(&mut self, ctx: &egui::Context, hwnd: isize, extra: Vec<Action>) {
         // 変換中は IME から文節 (どれが変換対象か) を取得する。失敗時は空 (全体表示)
         if self.ime_guard.composing {
             self.ime_guard.segs = ime::query(hwnd, &self.ime_guard.preedit);
         } else if !self.ime_guard.segs.is_empty() {
             self.ime_guard.segs.clear();
         }
-        let mut acts = Vec::new();
-
-        // バックグラウンドの読み込みが終わっていれば取り込む
-        self.poll_loads(ctx);
+        let mut acts = extra;
 
         // ウィンドウへのドラッグ&ドロップで開く
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -2400,12 +2856,12 @@ impl App {
             self.open_path(p);
         }
 
-        // ウィンドウを閉じる要求。未保存の文書があるかの判断は、この描画の編集欄の処理が
-        // 終わった後で行う (同じ描画で最初の入力と閉じる要求が届くと、入力による変更ありへの
-        // 切り替えが画面の処理の途中になり、ここで判断すると見逃してしまうため)
+        // ウィンドウを閉じる要求。未保存の文書があるかの判断は、この描画の編集欄の処理と、
+        // 画面の操作 (「すべて置換」など本文や保存形式を変える操作) がすべて終わった後で行う
+        // (同じ描画で入力や操作と閉じる要求が届くと、先に判断すると変更を見逃してしまうため)
         let close_requested = ctx.input(|i| i.viewport().close_requested());
 
-        let enabled = self.modal.is_none();
+        let enabled = self.modals.is_empty();
         if enabled {
             self.shortcuts(ctx, &mut acts);
         }
@@ -2427,6 +2883,7 @@ impl App {
             self.last_title = title;
         }
 
+        self.update_find_pos(ctx);
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             ui.add_enabled_ui(enabled, |ui| self.menu_bar(ui, &mut acts));
         });
@@ -2443,19 +2900,26 @@ impl App {
             ui.add_enabled_ui(enabled, |ui| self.editor(ui));
         });
 
-        // 編集欄の処理が終わったので、未保存の文書があるか確かめる。あれば閉じるのを取り消して確認する
-        // (なければ、閉じる要求をそのまま通す)
-        if close_requested && !self.allow_exit && self.docs.iter().any(|d| d.dirty) {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            self.modal = Some(Modal::ConfirmExit);
-        }
+        // バックグラウンドの読み込みが終わっていれば取り込む。編集欄の処理の後に行う
+        // (フレームの最初に行うと、このフレームの入力が、取り込みで切り替わった新しいタブへ届く)
+        self.poll_loads(ctx);
 
-        if let Some(m) = self.modal.clone() {
+        if let Some(m) = self.modals.front().cloned() {
             self.show_modal(ctx, m, &mut acts);
         }
 
         for a in acts {
             self.run(ctx, a);
+        }
+
+        // 本文や保存形式を変える操作がすべて終わったので、未保存の文書があるか確かめる。
+        // あれば閉じるのを取り消して確認する (なければ、閉じる要求をそのまま通す)
+        if close_requested && !self.allow_exit && self.docs.iter().any(|d| d.dirty) {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            if !self.modals.iter().any(|m| matches!(m, Modal::ConfirmExit)) {
+                self.push_modal(Modal::ConfirmExit);
+            }
+            ctx.request_repaint(); // 確認の画面を、次のフレームで出す
         }
     }
 
@@ -2536,7 +3000,10 @@ impl App {
                                 id,
                                 path: path.clone(),
                                 then,
-                                ok: Confirmed { lossy: true, ..ok },
+                                ok: Confirmed {
+                                    lossy: true,
+                                    ..ok.clone()
+                                },
                             });
                         }
                         if ui.button("キャンセル").clicked() {
@@ -2565,7 +3032,7 @@ impl App {
                                 then,
                                 ok: Confirmed {
                                     lossy_load: true,
-                                    ..ok
+                                    ..ok.clone()
                                 },
                             });
                         }
@@ -2583,23 +3050,25 @@ impl App {
                 path,
                 then,
                 ok,
+                seen,
             } => {
                 win("ファイルが変更されています").show(ctx, |ui| {
                     ui.label(format!(
-                        "このファイルは、開いた後に他のプログラムで変更または削除されています:\n{}\n\n\
+                        "このファイルは、開いた後に他のプログラムで変更・削除・作成されています:\n{}\n\n\
                          上書きすると、その変更は失われます。",
                         path.display()
                     ));
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("上書きする").clicked() {
+                            // いま見えている状態を承知したものとして、保存の直前にもう一度確かめる
                             acts.push(Action::SaveConfirmed {
                                 id,
                                 path: path.clone(),
                                 then,
                                 ok: Confirmed {
-                                    conflict: true,
-                                    ..ok
+                                    conflict: Some(seen.clone()),
+                                    ..ok.clone()
                                 },
                             });
                         }
@@ -2644,6 +3113,37 @@ impl App {
                             acts.push(Action::OpenAnyway(path.clone()));
                         }
                         if ui.button("キャンセル").clicked() {
+                            acts.push(Action::DismissModal);
+                        }
+                    });
+                });
+            }
+            Modal::Utf32 {
+                path,
+                name,
+                as_utf16,
+            } => {
+                win("対応していない形式").show(ctx, |ui| {
+                    ui.label(format!(
+                        "{}\nは {} の BOM で始まっています。UTF-32 には対応していません。\n\
+                         UTF-16 / UTF-8 / Shift_JIS などに変換してから開いてください。",
+                        path.display(),
+                        name
+                    ));
+                    if as_utf16.is_some() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            "先頭が U+0000 の UTF-16 LE (BOM 付き) のファイルである可能性もあります。",
+                        );
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if let Some(enc) = as_utf16 {
+                            if ui.button("UTF-16 として開く").clicked() {
+                                acts.push(Action::OpenAs(path.clone(), enc));
+                            }
+                        }
+                        if ui.button("閉じる").clicked() {
                             acts.push(Action::DismissModal);
                         }
                     });
@@ -2739,6 +3239,8 @@ mod undo_tests {
         t: f64,
         /// 自動インデントを有効にするか (アプリの `editor` と同じ呼び出しを再現する)
         auto_indent: bool,
+        /// 自動インデントが次のフレームへ持ち越した入力 (アプリの `deferred_events` と同じ)
+        deferred: Vec<egui::Event>,
     }
 
     fn ed() -> egui::Id {
@@ -2765,6 +3267,7 @@ mod undo_tests {
                 field: String::new(),
                 t: 0.0,
                 auto_indent: false,
+                deferred: Vec::new(),
             }
         }
         fn with_indent(text: &str) -> Self {
@@ -2779,8 +3282,10 @@ mod undo_tests {
             set_editor_sel(&self.ctx, ed(), a, b);
             self.frame(0.05, vec![]);
         }
-        fn frame(&mut self, dt: f64, events: Vec<egui::Event>) {
+        fn frame(&mut self, dt: f64, mut events: Vec<egui::Event>) {
             self.t += dt;
+            // 前のフレームで持ち越した入力を先頭へ戻す (アプリの `raw_input_hook` と同じ)
+            events.splice(0..0, std::mem::take(&mut self.deferred));
             let raw = egui::RawInput {
                 time: Some(self.t),
                 events,
@@ -2791,11 +3296,12 @@ mod undo_tests {
                 ..Default::default()
             };
             let (text, fld, ai) = (&mut self.text, &mut self.field, self.auto_indent);
+            let deferred = &mut self.deferred;
             let _ = self.ctx.run(raw, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.add(egui::TextEdit::singleline(fld).id(field()));
                     if ai {
-                        apply_auto_indent(ctx, ed(), text);
+                        *deferred = apply_auto_indent(ctx, ed(), text);
                     }
                     ui.add(egui::TextEdit::multiline(text).id(ed()));
                 });
@@ -2952,6 +3458,128 @@ mod undo_tests {
             h.guarded(&mut g, 0.05, vec![ime(Disabled)]);
             assert_eq!(h.text, "x漢字", "{cleared:?}");
         }
+    }
+
+    /// 変換を取り消した (確定が続かずに Disabled だけが来た) とき、egui が本文へ挿入した
+    /// 未確定文字列を残さない
+    #[test]
+    fn ime_cancel_removes_preedit_text() {
+        use egui::ImeEvent::*;
+        let ime = |e: egui::ImeEvent| egui::Event::Ime(e);
+        let mut h = Harness::new("x");
+        let mut g = ImeGuard::default();
+        h.select(1, 1);
+        h.guarded(&mut g, 0.05, vec![ime(Enabled), ime(Preedit("あ".into()))]);
+        assert_eq!(h.text, "xあ", "変換中は未確定文字列が本文に入っている");
+        h.guarded(&mut g, 0.05, vec![ime(Disabled), ime(Disabled)]);
+        assert_eq!(h.text, "x", "取り消しで未確定文字列が消える");
+        assert_eq!(editor_sel(&h.ctx, ed()), Some((1, 1)));
+        // 取り消しの後の通常の変換・確定は効く
+        h.guarded(&mut g, 0.05, vec![ime(Enabled), ime(Preedit("かんじ".into()))]);
+        h.guarded(
+            &mut g,
+            0.05,
+            vec![ime(Disabled), ime(Commit("漢字".into())), ime(Disabled)],
+        );
+        assert_eq!(h.text, "x漢字", "本物の確定は、挿入した空の Preedit の後でも入る");
+    }
+
+    /// 挿入した空の Preedit は、偽の確定の判定に数えない (確定の前に Disabled が 1 つ来る
+    /// ふつうの確定を、偽物として捨てない)
+    #[test]
+    fn ime_injected_preedit_is_not_counted_as_fake_commit_evidence() {
+        use egui::ImeEvent::*;
+        let ime = |e: egui::ImeEvent| egui::Event::Ime(e);
+        let mut g = ImeGuard::default();
+        let mut evs = vec![ime(Enabled), ime(Preedit("あ".into())), ime(Disabled)];
+        g.filter(0.0, &mut evs);
+        assert_eq!(
+            evs,
+            vec![
+                ime(Enabled),
+                ime(Preedit("あ".into())),
+                ime(Preedit(String::new())),
+                ime(Disabled)
+            ]
+        );
+        let mut evs = vec![ime(Commit("あ".into())), ime(Disabled)];
+        g.filter(0.01, &mut evs);
+        assert_eq!(evs[0], ime(Commit("あ".into())), "確定は捨てない");
+        // 変換中でない Disabled には何も足さない
+        let mut evs = vec![ime(Disabled)];
+        g.filter(0.02, &mut evs);
+        assert_eq!(evs, vec![ime(Disabled)]);
+    }
+
+    fn enter_release() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    fn count_enter_presses(evs: &[egui::Event]) -> usize {
+        evs.iter()
+            .filter(|e| matches!(e, egui::Event::Key { key: Key::Enter, pressed: true, .. }))
+            .count()
+    }
+
+    /// 変換中の Enter → 確定 → Enter の離した通知 → 次の Enter: 最後の Enter は本物の改行
+    #[test]
+    fn ime_enter_release_ends_the_dropped_press() {
+        use egui::ImeEvent::*;
+        let ime = |e: egui::ImeEvent| egui::Event::Ime(e);
+        let mut g = ImeGuard::default();
+        g.filter(1.0, &mut vec![ime(Enabled), ime(Preedit("あ".into()))]);
+        let mut evs = vec![enter()]; // 変換中: 確定の Enter (取り除く)
+        g.filter(1.01, &mut evs);
+        assert_eq!(count_enter_presses(&evs), 0);
+        g.filter(1.02, &mut vec![ime(Disabled), ime(Commit("あ".into()))]);
+        // 離した通知
+        let mut evs = vec![enter_release()];
+        g.filter(1.03, &mut evs);
+        assert_eq!(evs.len(), 1, "離した通知は通す");
+        // 確定の直後 (猶予の間) でも、離した後の押下は本物の Enter
+        let mut evs = vec![enter()];
+        g.filter(1.04, &mut evs);
+        assert_eq!(count_enter_presses(&evs), 1);
+    }
+
+    /// 確定 → (遅れて届く) Enter → 離した通知 → 次の Enter: 最後の Enter は本物の改行
+    #[test]
+    fn ime_late_confirm_enter_then_release_then_real_enter() {
+        use egui::ImeEvent::*;
+        let ime = |e: egui::ImeEvent| egui::Event::Ime(e);
+        let mut g = ImeGuard::default();
+        g.filter(1.0, &mut vec![ime(Enabled), ime(Preedit("あ".into()))]);
+        g.filter(1.01, &mut vec![ime(Disabled), ime(Commit("あ".into()))]);
+        let mut evs = vec![enter()];
+        g.filter(1.02, &mut evs);
+        assert_eq!(count_enter_presses(&evs), 0, "遅れて届いた確定の Enter");
+        let mut evs = vec![enter_release(), enter()];
+        g.filter(1.03, &mut evs);
+        assert_eq!(count_enter_presses(&evs), 1, "離した後の Enter は本物");
+    }
+
+    /// 変換中の Enter → 確定 → 離した通知が来ないまま Enter: 同じ押下の続きとして取り除くが、
+    /// 猶予を過ぎれば通す (離した通知が届かなくても、Enter が効かなくなり続けない)
+    #[test]
+    fn ime_enter_without_release_times_out() {
+        use egui::ImeEvent::*;
+        let ime = |e: egui::ImeEvent| egui::Event::Ime(e);
+        let mut g = ImeGuard::default();
+        g.filter(1.0, &mut vec![ime(Enabled), ime(Preedit("あ".into()))]);
+        g.filter(1.01, &mut vec![enter()]);
+        g.filter(1.02, &mut vec![ime(Disabled), ime(Commit("あ".into()))]);
+        let mut evs = vec![enter()];
+        g.filter(1.03, &mut evs);
+        assert_eq!(count_enter_presses(&evs), 0, "同じ押下の続き");
+        let mut evs = vec![enter()];
+        g.filter(1.2, &mut evs);
+        assert_eq!(count_enter_presses(&evs), 1, "猶予を過ぎたら通す");
     }
 
     /// 変換中の文字列なしに来る確定 (全角スペースなど) はそのまま入る
@@ -3137,13 +3765,61 @@ mod undo_tests {
         assert_eq!(h.text, "    abcd\n    ");
     }
 
-    /// 同じフレームの入力の順序を保つ (先に来た文字の後ろで改行する)
+    /// 同じフレームの入力の順序を保つ (先に来た文字の後ろで改行する)。
+    /// Enter より前に本文を書き換える入力があるときは、その Enter を次のフレームへ持ち越して、
+    /// 更新後の本文でインデントを求める
     #[test]
     fn auto_indent_keeps_event_order() {
         let mut h = Harness::with_indent("  a");
         h.select(3, 3);
         h.frame(0.05, vec![egui::Event::Text("b".into()), enter()]);
+        assert_eq!(h.text, "  ab", "Enter は次のフレームへ持ち越される");
+        assert_eq!(h.deferred.len(), 1);
+        h.frame(0.05, vec![]);
         assert_eq!(h.text, "  ab\n  ");
+        assert!(h.deferred.is_empty());
+    }
+
+    /// 同じフレームで、空白を入力してから Enter: 入力した空白がインデントとして引き継がれる
+    #[test]
+    fn auto_indent_sees_text_typed_earlier_in_the_frame() {
+        let mut h = Harness::with_indent("");
+        h.select(0, 0);
+        h.frame(0.05, vec![egui::Event::Text("  ".into()), enter()]);
+        h.frame(0.05, vec![]);
+        assert_eq!(h.text, "  \n  ");
+    }
+
+    /// 複数行を貼り付けた直後の Enter は、貼り付けた最後の行のインデントを使う
+    #[test]
+    fn auto_indent_after_multiline_paste_uses_pasted_last_line() {
+        let mut h = Harness::with_indent("    old");
+        h.select(7, 7);
+        h.frame(0.05, vec![egui::Event::Paste("\n\t\tx".into()), enter()]);
+        h.frame(0.05, vec![]);
+        assert_eq!(h.text, "    old\n\t\tx\n\t\t");
+    }
+
+    /// Enter が 2 回あるときも、2 回目は 1 回目の結果の本文で処理される (順序も保たれる)
+    #[test]
+    fn auto_indent_two_enters_in_one_frame() {
+        let mut h = Harness::with_indent("  a");
+        h.select(3, 3);
+        h.frame(0.05, vec![enter(), enter(), egui::Event::Text("z".into())]);
+        h.frame(0.05, vec![]);
+        h.frame(0.05, vec![]);
+        assert_eq!(h.text, "  a\n  \n  z");
+    }
+
+    /// インデントは本文を複製せずに、キャレットから行頭へバイト列をたどって求める
+    #[test]
+    fn line_indent_scans_bytes_back_from_caret() {
+        assert_eq!(line_indent("  \tabc", 6), "  \t");
+        assert_eq!(line_indent("a\n  b", 5), "  ");
+        assert_eq!(line_indent("a\n  b", 3), " ");
+        assert_eq!(line_indent("abc", 3), "");
+        assert_eq!(line_indent("あ\n  い", search::char_to_byte("あ\n  い", 4)), "  ");
+        assert_eq!(line_indent("  ", 100), "  ", "範囲外は末尾にそろえる");
     }
 
     /// Undo 後に改行すると、古い Redo は使えなくなる
@@ -3328,7 +4004,7 @@ mod app_tests {
     fn edit(app: &mut App, idx: usize, f: impl FnOnce(&mut String)) {
         let d = &mut app.docs[idx];
         f(&mut d.text);
-        d.rev += 1;
+        d.edited();
         d.update_dirty();
     }
 
@@ -3372,7 +4048,7 @@ mod app_tests {
     /// 現在の確認の画面で「保存する側」の答えを選んで実行する
     fn confirm(app: &mut App) {
         let ctx = app.ctx.clone();
-        let act = match app.modal.clone() {
+        let act = match app.modal().cloned() {
             Some(Modal::Lossy {
                 id,
                 path,
@@ -3404,12 +4080,13 @@ mod app_tests {
                 path,
                 then,
                 ok,
+                seen,
             }) => Action::SaveConfirmed {
                 id,
                 path,
                 then,
                 ok: Confirmed {
-                    conflict: true,
+                    conflict: Some(seen),
                     ..ok
                 },
             },
@@ -3451,15 +4128,45 @@ mod app_tests {
         let t = Tmp::new();
         let mut app = app();
         open(&mut app, &t.0.join("none.txt"));
-        assert!(matches!(app.modal, Some(Modal::Info(_))));
+        assert!(matches!(app.modal(), Some(Modal::Info(_))));
         assert_eq!(app.docs.len(), 1);
         assert!(app.docs[0].path.is_none());
-        // UTF-32 は未対応として開かない
+        // UTF-32 は未対応として開かない (UTF-16 としても読める形なので、その選択肢を出す)
         let u32p = t.file("u32.txt", &[0xFF, 0xFE, 0, 0, b'a', 0, 0, 0]);
-        app.modal = None;
+        app.modals.clear();
         open(&mut app, &u32p);
-        assert!(matches!(&app.modal, Some(Modal::Info(m)) if m.contains("UTF-32")));
+        assert!(matches!(
+            app.modal(),
+            Some(Modal::Utf32 { name: "UTF-32 LE", as_utf16: Some(Enc::Utf16Le), .. })
+        ));
         assert!(app.docs[0].path.is_none());
+        // 「UTF-16 として開く」を選ぶと、UTF-16 LE (BOM 付き) で開く
+        let ctx = app.ctx.clone();
+        app.run(&ctx, Action::OpenAs(u32p.clone(), Enc::Utf16Le));
+        wait_loads(&mut app);
+        assert!(app.modal().is_none());
+        assert_eq!(app.docs[0].path.as_deref(), Some(u32p.as_path()));
+        assert_eq!(app.docs[0].enc, Enc::Utf16Le);
+        assert_eq!(app.docs[0].text, "\u{0}a\u{0}");
+        // UTF-32 BE は UTF-16 としては読めないので、選択肢は出さない
+        let be = t.file("u32be.txt", &[0, 0, 0xFE, 0xFF, 0, 0, 0, b'a']);
+        open(&mut app, &be);
+        assert!(matches!(
+            app.modal(),
+            Some(Modal::Utf32 { name: "UTF-32 BE", as_utf16: None, .. })
+        ));
+    }
+
+    /// 先頭が U+0000 の UTF-16 LE は、UTF-32 として断らずに UTF-16 で開く
+    #[test]
+    fn utf16_starting_with_nul_opens_as_utf16() {
+        let t = Tmp::new();
+        let p = t.file("nul.txt", &[0xFF, 0xFE, 0x00, 0x00, 0x41, 0x00]);
+        let mut app = app();
+        open(&mut app, &p);
+        assert!(app.modal().is_none());
+        assert_eq!(app.docs[0].enc, Enc::Utf16Le);
+        assert_eq!(app.docs[0].text, "\u{0}A");
     }
 
     /// 大きなファイルは、読み込む前に確認する
@@ -3472,7 +4179,7 @@ mod app_tests {
         drop(f);
         let mut app = app();
         app.open_path(p);
-        assert!(matches!(app.modal, Some(Modal::ConfirmLargeOpen { .. })));
+        assert!(matches!(app.modal(), Some(Modal::ConfirmLargeOpen { .. })));
         assert!(app.loads.is_empty());
     }
 
@@ -3493,7 +4200,7 @@ mod app_tests {
         let ctx = app.ctx.clone();
         app.run(&ctx, Action::Save);
         assert!(app.status.contains("変更はありません"));
-        assert!(app.modal.is_none());
+        assert!(app.modal().is_none());
         assert_eq!(std::fs::read(&p).unwrap(), bad);
     }
 
@@ -3509,7 +4216,7 @@ mod app_tests {
         app.run(&ctx, Action::SetEol(Eol::Lf));
         assert!(app.docs[0].dirty);
         app.run(&ctx, Action::Save);
-        assert!(matches!(app.modal, Some(Modal::LossyLoad { .. })));
+        assert!(matches!(app.modal(), Some(Modal::LossyLoad { .. })));
         assert_eq!(std::fs::read(&p).unwrap(), bad, "確認の前には書かない");
         confirm(&mut app);
         assert_eq!(
@@ -3518,7 +4225,7 @@ mod app_tests {
         );
         assert!(!app.docs[0].lossy_load);
         assert!(!app.docs[0].dirty);
-        assert!(app.modal.is_none());
+        assert!(app.modal().is_none());
     }
 
     /// 別の名前への保存は、元のバイトを壊さないので確認しない
@@ -3548,7 +4255,7 @@ mod app_tests {
         let id = app.docs[0].id;
         app.run(&ctx, Action::SaveAndClose(id));
         assert!(matches!(
-            app.modal,
+            app.modal(),
             Some(Modal::Conflict {
                 then: Then::Close(_),
                 ..
@@ -3571,7 +4278,7 @@ mod app_tests {
         edit(&mut app, 0, |s| s.push('x'));
         let ctx = app.ctx.clone();
         app.run(&ctx, Action::Save);
-        assert!(matches!(app.modal, Some(Modal::Conflict { .. })));
+        assert!(matches!(app.modal(), Some(Modal::Conflict { .. })));
         assert!(!p.exists());
         confirm(&mut app);
         assert!(p.exists());
@@ -3593,7 +4300,7 @@ mod app_tests {
         let ctx = app.ctx.clone();
         app.run(&ctx, Action::SaveAllAndExit);
         assert!(matches!(
-            app.modal,
+            app.modal(),
             Some(Modal::Conflict {
                 then: Then::SaveAll,
                 ..
@@ -3602,7 +4309,7 @@ mod app_tests {
         assert!(!app.allow_exit);
         assert_eq!(std::fs::read(&a).unwrap(), b"external");
         confirm(&mut app);
-        assert!(app.modal.is_none());
+        assert!(app.modal().is_none());
         assert!(app.allow_exit, "確認の後に続きを行い、終了できる");
         assert!(app.docs.iter().all(|d| !d.dirty));
         assert_eq!(std::fs::read(&a).unwrap(), b"a1");
@@ -3622,7 +4329,7 @@ mod app_tests {
         let ctx = app.ctx.clone();
         assert!(!app.write_doc(&ctx, 1, a.clone(), Then::None, Confirmed::default()));
         assert!(
-            matches!(&app.modal, Some(Modal::Info(m)) if m.contains("別のタブで開いています"))
+            matches!(app.modal(), Some(Modal::Info(m)) if m.contains("別のタブで開いています"))
         );
         assert_eq!(std::fs::read(&a).unwrap(), b"a");
         assert!(app.docs[1].dirty);
@@ -3641,7 +4348,7 @@ mod app_tests {
         edit(&mut app, 0, |s| s.push('x'));
         let ctx = app.ctx.clone();
         app.run(&ctx, Action::Save);
-        assert!(matches!(&app.modal, Some(Modal::Info(m)) if m.contains("保存に失敗")));
+        assert!(matches!(app.modal(), Some(Modal::Info(m)) if m.contains("保存に失敗")));
         assert!(app.docs[0].dirty);
         assert_eq!(std::fs::read(&p).unwrap(), b"orig");
         perm.set_readonly(false);
@@ -3671,7 +4378,7 @@ mod app_tests {
                     Action::Save
                 },
             );
-            match &app.modal {
+            match app.modal() {
                 Some(Modal::Lossy { examples, then, .. }) => {
                     assert_eq!(examples, &vec!["\u{a5} → \\".to_string()]);
                     assert_eq!(*then == Then::Close(id), close);
@@ -3705,7 +4412,7 @@ mod app_tests {
         edit(&mut app, 0, |s| s.push_str(" + edit"));
         let ctx = app.ctx.clone();
         app.run(&ctx, Action::Reload(Enc::Utf8));
-        assert!(matches!(app.modal, Some(Modal::ConfirmReload { .. })));
+        assert!(matches!(app.modal(), Some(Modal::ConfirmReload { .. })));
         assert!(app.docs[0].dirty);
         assert!(app.loads.is_empty());
         // ディスクのファイルが変わっていたら、それを読む (メモリ上の古いバイトではなく)
@@ -3718,7 +4425,7 @@ mod app_tests {
         // 読み直した後は、その状態が保存済みの基準になり、競合も起きない
         edit(&mut app, 0, |s| s.push('!'));
         app.run(&ctx, Action::Save);
-        assert!(app.modal.is_none(), "{:?}", app.status);
+        assert!(app.modal().is_none(), "{:?}", app.status);
         assert_eq!(std::fs::read(&p).unwrap(), b"disk v2!");
     }
 
@@ -3733,7 +4440,7 @@ mod app_tests {
         let ctx = app.ctx.clone();
         app.run(&ctx, Action::Reload(Enc::Utf8));
         wait_loads(&mut app);
-        assert!(matches!(app.modal, Some(Modal::Info(_))));
+        assert!(matches!(app.modal(), Some(Modal::Info(_))));
         assert_eq!(app.docs[0].text, "abc");
     }
 
@@ -3750,7 +4457,7 @@ mod app_tests {
             "xyz".into(),
             (0, 0)
         ));
-        reset_editor_state(&ctx, id);
+        reset_editor_state(&ctx, id, text.len());
         let mut u = TextEditState::load(&ctx, id).unwrap().undoer();
         assert!(u.undo(&(CCursorRange::default(), text)).is_none());
     }
@@ -3774,7 +4481,7 @@ mod app_tests {
         assert_eq!(app.docs[0].text, "x");
         assert!(app.docs[0].dirty);
         assert!(cancels_close(&out), "閉じるのを取り消す");
-        assert!(matches!(app.modal, Some(Modal::ConfirmExit)));
+        assert!(matches!(app.modal(), Some(Modal::ConfirmExit)));
     }
 
     /// 未保存の文書がなければ、閉じる要求は取り消さない
@@ -3786,7 +4493,7 @@ mod app_tests {
         frame(&ctx, &mut app, &mut t, vec![], false);
         let out = frame(&ctx, &mut app, &mut t, vec![], true);
         assert!(!cancels_close(&out));
-        assert!(app.modal.is_none());
+        assert!(app.modal().is_none());
     }
 
     /// 元の内容に戻したら、変更ありは解除される (Undo・改行コードの往復)
@@ -3948,32 +4655,602 @@ mod app_tests {
         assert_eq!(app.tab_shown, Some(app.docs[0].id));
     }
 
-    /// 検索の強調付きでも描画でき、本文が変わらない間は表示 (galley) を使い回す。
-    /// 本文が変わると作り直す。検索バー (折り返し付き) を開いたままの描画も確かめる
+    /// 検索の強調付き・検索バー (折り返し付き) を開いたままでも描画でき、本文が変わると
+    /// 強調と一致の一覧が新しい本文に追従する。galley は自前で使い回さず、egui のキャッシュに任せる
     #[test]
-    fn layout_is_cached_until_text_changes() {
+    fn highlight_follows_text_without_own_galley_cache() {
         let ctx = egui::Context::default();
         let mut app = App::blank(ctx.clone());
-        app.docs[0].text = "abc abc
-xyz abc".into();
-        app.docs[0].rev = 1;
+        app.docs[0].text = "abc abc\nxyz abc".into();
+        app.docs[0].edited();
         app.find.open = true;
         app.find.show_replace = true;
         app.find.query = "abc".into();
         let mut t = 0.0;
         frame(&ctx, &mut app, &mut t, vec![], false);
         frame(&ctx, &mut app, &mut t, vec![], false);
-        let g1 = app.docs[0].layout_cache.as_ref().unwrap().galley.clone();
         assert_eq!(app.docs[0].matches().len(), 3);
+        // 入力で本文が変わると、次の描画で一致の一覧も作り直される
+        frame(&ctx, &mut app, &mut t, vec![egui::Event::Text("abc".into())], false);
         frame(&ctx, &mut app, &mut t, vec![], false);
-        let g2 = app.docs[0].layout_cache.as_ref().unwrap().galley.clone();
-        assert!(Arc::ptr_eq(&g1, &g2), "変わらなければ再レイアウトしない");
-        // 入力で本文が変わると、次の描画で作り直される
-        frame(&ctx, &mut app, &mut t, vec![egui::Event::Text("Q".into())], false);
-        frame(&ctx, &mut app, &mut t, vec![], false);
-        let g3 = app.docs[0].layout_cache.as_ref().unwrap().galley.clone();
-        assert!(!Arc::ptr_eq(&g1, &g3));
-        assert!(g3.text().contains('Q'));
+        assert!(app.docs[0].text.contains("abc") && app.docs[0].text.len() > 15);
+        assert_eq!(
+            app.docs[0].matches().len(),
+            search::find_all(&app.docs[0].text, "abc", false).len()
+        );
         assert_eq!(app.docs[0].rev, 2);
+        // 自前の galley キャッシュは持たない (メモリ・フォントアトラス作り直しの問題を避ける)
+        assert!(app.docs[0].row_lines.is_some());
+    }
+
+    /// 行番号用の表は、同じ galley のときだけ使い回し、galley が変われば (フォントアトラスの
+    /// 作り直しや本文の変更で egui が新しい galley を作れば) 作り直す。galley 自体は持たない
+    #[test]
+    fn row_lines_do_not_keep_galley_alive() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let font = egui::FontId::monospace(14.0);
+        let mut cache = None;
+        let lay = |text: &str| {
+            ctx.fonts(|f| f.layout(text.into(), font.clone(), egui::Color32::WHITE, 100.0))
+        };
+        let g1 = lay("a\nb\nc");
+        assert_eq!(row_lines_for(&mut cache, &g1), &[1, 2, 3]);
+        // 表が持つのは Weak だけ (galley の寿命は egui のキャッシュが決める)
+        assert!(cache.as_ref().is_some_and(|c| c.galley.strong_count() >= 1));
+        let g2 = lay("a\nb");
+        assert_eq!(row_lines_for(&mut cache, &g2), &[1, 2], "別の galley なら作り直す");
+    }
+
+    // ---- 読み直し (項目 1)
+
+    /// 読み込み中に編集した文書へ、読み直しの結果を上書きしない
+    #[test]
+    fn reload_result_discarded_if_edited_while_loading() {
+        let t = Tmp::new();
+        let p = t.file("f.txt", b"disk v1");
+        let mut app = app();
+        open(&mut app, &p);
+        let ctx = app.ctx.clone();
+        app.run(&ctx, Action::Reload(Enc::Utf8)); // 未保存の編集は無いので、そのまま始まる
+        assert_eq!(app.loads.len(), 1);
+        edit(&mut app, 0, |s| s.push_str(" + typing"));
+        wait_loads(&mut app);
+        assert_eq!(app.docs[0].text, "disk v1 + typing", "編集は消えない");
+        assert!(app.docs[0].dirty);
+        assert!(app.status.contains("読み込み中に変更されたため、開き直しを中止しました"));
+    }
+
+    /// 読み込み中に名前を付けて保存した文書へ、元のファイルの内容と指紋を入れない
+    #[test]
+    fn reload_result_discarded_if_saved_as_elsewhere_while_loading() {
+        let t = Tmp::new();
+        let a = t.file("a.txt", b"from A");
+        let mut app = app();
+        open(&mut app, &a);
+        let ctx = app.ctx.clone();
+        app.run(&ctx, Action::Reload(Enc::Utf8));
+        edit(&mut app, 0, |s| s.push_str("!"));
+        let b = t.0.join("b.txt");
+        assert!(app.write_doc(&ctx, 0, b.clone(), Then::None, Confirmed::default()));
+        let fp_b = app.docs[0].fingerprint.clone();
+        wait_loads(&mut app);
+        assert_eq!(app.docs[0].path.as_deref(), Some(b.as_path()));
+        assert_eq!(app.docs[0].text, "from A!");
+        assert_eq!(app.docs[0].fingerprint, fp_b, "B の指紋のまま");
+        assert!(!app.docs[0].dirty);
+        assert!(app.status.contains("中止"));
+    }
+
+    /// 文字コード・改行コードを変えた場合も、読み込み中の結果は捨てる
+    #[test]
+    fn reload_result_discarded_if_encoding_changed_while_loading() {
+        let t = Tmp::new();
+        let p = t.file("f.txt", b"abc");
+        let mut app = app();
+        open(&mut app, &p);
+        let ctx = app.ctx.clone();
+        app.run(&ctx, Action::Reload(Enc::Utf8));
+        app.run(&ctx, Action::SetEol(Eol::Lf));
+        wait_loads(&mut app);
+        assert_eq!(app.docs[0].eol, Eol::Lf);
+        assert!(app.docs[0].dirty);
+        // 何も変わっていなければ取り込まれる
+        app.run(&ctx, Action::SetEol(Eol::CrLf));
+        app.run(&ctx, Action::Reload(Enc::Legacy(encoding_rs::SHIFT_JIS)));
+        wait_loads(&mut app);
+        assert!(app.status.contains("再読み込み"), "{}", app.status);
+    }
+
+    // ---- 外部変更の承知 (項目 3)
+
+    /// 「上書きする」と答えた後、別の確認を出している間にファイルがもう一度変わったら、
+    /// 気づかずに上書きせず、もう一度確認する
+    #[test]
+    fn second_external_change_after_approval_asks_again() {
+        let t = Tmp::new();
+        let p = t.file("f.txt", b"one");
+        let mut app = app();
+        open(&mut app, &p);
+        let sjis = Enc::Legacy(encoding_rs::SHIFT_JIS);
+        app.docs[0].enc = sjis;
+        app.docs[0].eol = Eol::Lf;
+        edit(&mut app, 0, |s| s.push('\u{a5}'));
+        std::fs::write(&p, b"first external change").unwrap();
+        let ctx = app.ctx.clone();
+        app.run(&ctx, Action::Save);
+        assert!(matches!(app.modal(), Some(Modal::Conflict { .. })));
+        confirm(&mut app); // 1 回目の変更は承知。次に文字コードの警告が出る
+        assert!(matches!(app.modal(), Some(Modal::Lossy { .. })), "{:?}", app.status);
+        // 警告を出している間に、ファイルが 2 回目の変更を受ける
+        std::fs::write(&p, b"second, different external change").unwrap();
+        confirm(&mut app);
+        assert!(
+            matches!(app.modal(), Some(Modal::Conflict { .. })),
+            "もう一度確認する"
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), b"second, different external change");
+        assert!(app.docs[0].dirty);
+        // 新しい状態を承知して上書きすれば保存できる (文字コードの警告には答え済み)
+        confirm(&mut app);
+        assert!(app.modal().is_none(), "{:?}", app.status);
+        assert_eq!(std::fs::read(&p).unwrap(), [b'o', b'n', b'e', 0x5C]);
+    }
+
+    /// 新しいファイルの保存先に、確認の後で同じ名前のファイルができていたら、上書きせず確認する
+    #[test]
+    fn late_created_file_is_not_overwritten() {
+        let t = Tmp::new();
+        let mut app = app();
+        let ctx = app.ctx.clone();
+        let target = t.0.join("new.txt");
+        edit(&mut app, 0, |s| s.push_str("mine"));
+        // 保存先は存在しない → そのつもりで書き始めるが、直前に他のプログラムが作る
+        // (write_doc の途中は割り込めないので、期待が崩れた状況を直接 fileio で再現する)
+        std::fs::write(&target, b"theirs").unwrap();
+        let r = fileio::atomic_write(&target, b"mine", &fileio::Expect::Is(None));
+        assert_eq!(r, Err(fileio::WriteError::Conflict));
+        assert_eq!(std::fs::read(&target).unwrap(), b"theirs");
+        // アプリ経由でも、今ある状態を見て確認なしに上書きすることはない
+        // (名前を付けて保存で既存ファイルを選んだときは、OS のダイアログが確認済み)
+        assert!(app.write_doc(&ctx, 0, target.clone(), Then::None, Confirmed::default()));
+        assert_eq!(std::fs::read(&target).unwrap(), b"mine");
+    }
+
+    // ---- フォーカス・取り込みの順序 (項目 7)
+
+    /// 読み込み中にユーザーが別のタブへ移っていたら、開いたタブを選択しない
+    #[test]
+    fn finished_open_does_not_steal_active_tab() {
+        let t = Tmp::new();
+        let a = t.file("a.txt", b"aaa");
+        let b = t.file("b.txt", b"bbb");
+        let mut app = app();
+        open(&mut app, &a);
+        app.open_path(b.clone());
+        let ctx = app.ctx.clone();
+        app.run(&ctx, Action::New); // 読み込み中に、新しいタブへ移った
+        let before = app.active;
+        wait_loads(&mut app);
+        assert_eq!(app.docs.len(), 3, "タブは追加される");
+        assert_eq!(app.active, before, "選択は動かない");
+        assert!(app.docs[app.active].path.is_none());
+        assert!(app.status.contains("「b.txt」を開きました"), "{}", app.status);
+        // 何も変えなければ、従来どおり開いたタブを選択する
+        let c = t.file("c.txt", b"ccc");
+        open(&mut app, &c);
+        assert_eq!(app.docs[app.active].title(), "c.txt");
+    }
+
+    /// 読み込みが終わるのと同じフレームのキー入力は、元のタブへ届く (取り込みは編集欄の後)
+    #[test]
+    fn completion_in_same_frame_does_not_retarget_input() {
+        let t = Tmp::new();
+        let a = t.file("a.txt", b"aaa");
+        let b = t.file("b.txt", b"bbb");
+        let ctx = egui::Context::default();
+        let mut app = App::blank(ctx.clone());
+        let mut clock = 0.0;
+        app.open_path(a);
+        wait_loads(&mut app);
+        for _ in 0..3 {
+            frame(&ctx, &mut app, &mut clock, vec![], false); // 編集欄にフォーカスが付く
+        }
+        app.open_path(b);
+        // 読み込みのスレッドが終わるまで待つ (結果の取り込みは、次のフレームの最後に行われる)
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        frame(
+            &ctx,
+            &mut app,
+            &mut clock,
+            vec![egui::Event::Text("x".into())],
+            false,
+        );
+        let a_idx = app
+            .docs
+            .iter()
+            .position(|d| d.title() == "a.txt")
+            .expect("a が開いている");
+        let b_idx = app
+            .docs
+            .iter()
+            .position(|d| d.title() == "b.txt")
+            .expect("b も取り込まれている");
+        assert!(app.docs[a_idx].text.contains('x'), "入力は元のタブへ: {:?}", app.docs[a_idx].text);
+        assert_eq!(app.docs[b_idx].text, "bbb", "新しいタブには入らない");
+        assert_eq!(app.active, b_idx, "取り込みの後で、新しいタブを選択する");
+    }
+
+    // ---- 確認の待ち行列 (項目 8)
+
+    /// 大きなファイルを 2 つ続けて開こうとしても、確認はどちらも残る
+    #[test]
+    fn two_large_open_confirmations_are_both_kept() {
+        let t = Tmp::new();
+        let mk = |name: &str| {
+            let p = t.0.join(name);
+            let f = std::fs::File::create(&p).unwrap();
+            f.set_len(fileio::LARGE_FILE_BYTES + 1).unwrap();
+            p
+        };
+        let (a, b) = (mk("big_a.bin"), mk("big_b.bin"));
+        let mut app = app();
+        app.open_path(a.clone());
+        app.open_path(b.clone());
+        assert_eq!(app.modals.len(), 2);
+        assert!(matches!(app.modal(), Some(Modal::ConfirmLargeOpen { path, .. }) if *path == a));
+        let ctx = app.ctx.clone();
+        app.run(&ctx, Action::DismissModal);
+        assert!(matches!(app.modal(), Some(Modal::ConfirmLargeOpen { path, .. }) if *path == b));
+    }
+
+    /// 保存の途中の確認 (続きの操作つき) は、バックグラウンドの読み込みの失敗の通知で消えない
+    #[test]
+    fn background_failure_does_not_replace_save_flow_modal() {
+        let t = Tmp::new();
+        let p = t.file("f.txt", b"one");
+        let mut app = app();
+        open(&mut app, &p);
+        std::fs::write(&p, b"changed elsewhere").unwrap();
+        edit(&mut app, 0, |s| s.push_str("-mine"));
+        let ctx = app.ctx.clone();
+        let id = app.docs[0].id;
+        app.run(&ctx, Action::SaveAndClose(id));
+        assert!(matches!(app.modal(), Some(Modal::Conflict { then: Then::Close(_), .. })));
+        // 読み込みの失敗が届く
+        open(&mut app, &t.0.join("missing.txt"));
+        assert_eq!(app.modals.len(), 2);
+        assert!(
+            matches!(app.modal(), Some(Modal::Conflict { then: Then::Close(_), .. })),
+            "保存の確認が先頭のまま"
+        );
+        confirm(&mut app);
+        assert!(app.docs.iter().all(|d| d.id != id), "続きの操作 (閉じる) が行われた");
+        assert!(matches!(app.modal(), Some(Modal::Info(_))), "通知はその後で出る");
+    }
+
+    // ---- 閉じる要求と画面の操作 (項目 9)
+
+    /// 「すべて置換」と閉じる要求が同じフレームに来ても、置換後の未保存の変更を確認する
+    #[test]
+    fn replace_all_and_close_in_same_frame_is_confirmed() {
+        let ctx = egui::Context::default();
+        let mut app = App::blank(ctx.clone());
+        app.docs[0].text = "abc abc".into();
+        app.docs[0].mark_saved();
+        app.docs[0].edited();
+        app.find.open = true;
+        app.find.show_replace = true;
+        app.find.query = "abc".into();
+        app.find.replacement = "x".into();
+        let mut t = 0.0;
+        frame(&ctx, &mut app, &mut t, vec![], false);
+        assert!(!app.docs[0].dirty);
+        // 閉じる要求と、「すべて置換」のクリックが同じフレームに来る
+        t += 0.05;
+        let mut raw = egui::RawInput {
+            time: Some(t),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        raw.viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let out = ctx.run(raw, |ctx| {
+            app.update_ui_with(ctx, 0, vec![Action::ReplaceAll]);
+        });
+        assert_eq!(app.docs[0].text, "x x");
+        assert!(app.docs[0].dirty);
+        assert!(cancels_close(&out), "閉じるのを取り消す");
+        assert!(matches!(app.modal(), Some(Modal::ConfirmExit)));
+        // 確認が重複して積まれない
+        let mut raw = egui::RawInput {
+            time: Some(t + 0.05),
+            ..Default::default()
+        };
+        raw.viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let _ = ctx.run(raw, |ctx| app.update_ui(ctx, 0));
+        assert_eq!(app.modals.len(), 1);
+    }
+
+    // ---- Undo 履歴のメモリ (項目 10)
+
+    /// タブを閉じると、編集欄の状態 (Undo 履歴) も egui の記憶から取り除く
+    #[test]
+    fn closing_tab_forgets_editor_state() {
+        let ctx = egui::Context::default();
+        let mut app = App::blank(ctx.clone());
+        app.new_doc();
+        let id = app.docs[1].id;
+        let mut text = "abc".to_string();
+        assert!(replace_text_with_undo(
+            &ctx,
+            editor_id(id),
+            &mut text,
+            "xyz".into(),
+            (0, 0)
+        ));
+        assert!(TextEditState::load(&ctx, editor_id(id)).is_some());
+        assert_eq!(recorded_undo_limit(&ctx, editor_id(id)), 100);
+        app.close_now(1);
+        assert!(TextEditState::load(&ctx, editor_id(id)).is_none());
+        // 置き換えられた (空のタブ → 開いたファイル) 文書の状態も残さない
+        let t = Tmp::new();
+        let p = t.file("a.txt", b"aaa");
+        let blank_id = app.docs[0].id;
+        let mut s = String::new();
+        assert!(replace_text_with_undo(&ctx, editor_id(blank_id), &mut s, "".into(), (0, 0)));
+        open(&mut app, &p);
+        assert!(TextEditState::load(&ctx, editor_id(blank_id)).is_none());
+    }
+
+    /// 大きな文書ほど履歴の件数を絞る (全体で約 256 MiB に収める)
+    #[test]
+    fn undo_history_is_bounded_by_document_size() {
+        assert_eq!(undo_limit(0), 100);
+        assert_eq!(undo_limit(1024 * 1024), 100);
+        assert_eq!(undo_limit(10 * 1024 * 1024), 25);
+        assert_eq!(undo_limit(64 * 1024 * 1024), 4);
+        assert_eq!(undo_limit(1024 * 1024 * 1024), 2, "最小 2 件");
+        let ctx = egui::Context::default();
+        let id = editor_id(11);
+        reset_editor_state(&ctx, id, 64 * 1024 * 1024);
+        assert_eq!(recorded_undo_limit(&ctx, id), 4);
+        // 実際に、件数を超えた古い履歴は捨てられる
+        let mut u = bounded_undoer(2);
+        for i in 0..6 {
+            u.add_undo(&(CCursorRange::default(), format!("state {i}")));
+        }
+        let mut cur = (CCursorRange::default(), "state 6".to_string());
+        let mut steps = 0;
+        while let Some(prev) = u.undo(&cur).cloned() {
+            cur = prev;
+            steps += 1;
+            assert!(steps < 10);
+        }
+        assert!(steps <= 2, "{steps}");
+        // 大きな文書の置換では、履歴を絞った新しい履歴にする
+        let id2 = editor_id(12);
+        let mut text = "a".repeat(8 * 1024 * 1024);
+        let new_text = "b".repeat(8 * 1024 * 1024);
+        assert!(replace_text_with_undo(&ctx, id2, &mut text, new_text, (0, 0)));
+        assert_eq!(recorded_undo_limit(&ctx, id2), undo_limit(8 * 1024 * 1024));
+        assert_eq!(text.as_bytes()[0], b'b');
+    }
+
+    // ---- 保存の安全 (項目 11)
+
+    /// 保存に失敗したら、画面の文字も Undo 履歴も変えない (準備は書き込みの前に済ませるが、
+    /// 反映は書き込みの成功の後だけ)
+    #[test]
+    fn failed_lossy_save_leaves_text_and_history_untouched() {
+        let t = Tmp::new();
+        let p = t.file("f.txt", b"x");
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&p, perm.clone()).unwrap();
+        let mut app = app();
+        open(&mut app, &p);
+        let ctx = app.ctx.clone();
+        let id = app.docs[0].id;
+        app.docs[0].enc = Enc::Legacy(encoding_rs::SHIFT_JIS);
+        edit(&mut app, 0, |s| s.push('\u{a5}'));
+        app.run(&ctx, Action::Save);
+        confirm(&mut app); // 文字コードの警告に「それでも保存」
+        assert!(matches!(app.modal(), Some(Modal::Info(m)) if m.contains("保存に失敗")));
+        assert_eq!(app.docs[0].text, "x\u{a5}", "画面の文字はそのまま");
+        assert!(app.docs[0].dirty);
+        // Undo 履歴も触らない (開いたときの空の履歴のまま)
+        let mut u = TextEditState::load(&ctx, editor_id(id)).unwrap().undoer();
+        let cur = (CCursorRange::default(), app.docs[0].text.clone());
+        assert!(u.undo(&cur).is_none(), "履歴も触らない");
+        perm.set_readonly(false);
+        std::fs::set_permissions(&p, perm).unwrap();
+    }
+
+    /// 準備した置換は、反映するまで本文も履歴も変えず、反映後は 1 回の Ctrl+Z で戻せる
+    #[test]
+    fn prepared_replace_applies_only_on_apply() {
+        let ctx = egui::Context::default();
+        let id = editor_id(21);
+        let mut text = "a\u{a5}b".to_string();
+        let p = prepare_replace(&ctx, id, &text, "a\\b".into(), (0, 0)).unwrap();
+        assert_eq!(text, "a\u{a5}b");
+        assert!(TextEditState::load(&ctx, id).is_none());
+        p.apply(&ctx, id, &mut text);
+        assert_eq!(text, "a\\b");
+        let mut u = TextEditState::load(&ctx, id).unwrap().undoer();
+        let cur = (CCursorRange::default(), text.clone());
+        assert!(u.undo(&cur).is_some_and(|(_, s)| s == "a\u{a5}b"));
+    }
+
+    // ---- 検索 (項目 5 / 16)
+
+    /// 短い検索語を大きな文書で探しても、保存する一致は上限まで。
+    /// カーソルが一覧の外 (上限より後ろ) にあっても、次・前へ移動できる
+    #[test]
+    fn find_navigation_works_beyond_stored_matches() {
+        let ctx = egui::Context::default();
+        let mut app = App::blank(ctx.clone());
+        let n = search::MAX_STORED_MATCHES + 50_000;
+        app.docs[0].text = "a".repeat(n);
+        app.docs[0].edited();
+        app.find.query = "a".into();
+        app.docs[0].ensure_matches("a", false);
+        let c = app.docs[0].find_cache.as_ref().unwrap();
+        assert_eq!(c.matches.len(), search::MAX_STORED_MATCHES);
+        assert_eq!(c.byte_ranges.len(), search::MAX_STORED_MATCHES);
+        assert!(c.capped);
+        let id = editor_id(app.docs[0].id);
+        let far = search::MAX_STORED_MATCHES + 1_000;
+        set_editor_sel(&ctx, id, far, far);
+        app.run(&ctx, Action::FindNext);
+        assert_eq!(editor_sel(&ctx, id), Some((far, far + 1)));
+        app.run(&ctx, Action::FindNext);
+        assert_eq!(editor_sel(&ctx, id), Some((far + 1, far + 2)));
+        app.run(&ctx, Action::FindPrev);
+        assert_eq!(editor_sel(&ctx, id), Some((far, far + 1)));
+        assert!(app.status.contains("選択しました"), "{}", app.status);
+        // 末尾から次へ進むと、先頭へ折り返す
+        set_editor_sel(&ctx, id, n, n);
+        app.run(&ctx, Action::FindNext);
+        assert_eq!(editor_sel(&ctx, id), Some((0, 1)));
+        assert!(app.status.contains("100,000 件以上"), "{}", app.status);
+    }
+
+    /// 「すべて置換」は一致の一覧を作らずに走査し、置換後の大きさの上限は先に判定する
+    #[test]
+    fn replace_all_streams_without_match_list() {
+        let ctx = egui::Context::default();
+        let mut app = App::blank(ctx.clone());
+        app.docs[0].text = "a".repeat(500_000);
+        app.docs[0].edited();
+        app.find.query = "a".into();
+        app.find.replacement = "bb".into();
+        app.run(&ctx, Action::ReplaceAll);
+        assert_eq!(app.docs[0].text.len(), 1_000_000);
+        assert!(app.docs[0].text.bytes().all(|b| b == b'b'));
+        assert!(app.docs[0].find_cache.is_none(), "一覧は作らない");
+        assert!(app.status.contains("500000 件"), "{}", app.status);
+        // Ctrl+Z 相当で元に戻せる
+        let mut u = TextEditState::load(&ctx, editor_id(app.docs[0].id)).unwrap().undoer();
+        let cur = (CCursorRange::default(), app.docs[0].text.clone());
+        assert!(u.undo(&cur).is_some_and(|(_, s)| s.len() == 500_000));
+        // 上限を超える置換は、何も変えずに断る
+        let mut app = App::blank(egui::Context::default());
+        app.docs[0].text = "a".repeat(2000);
+        app.find.query = "a".into();
+        app.find.replacement = "x".repeat(300_000);
+        let ctx = app.ctx.clone();
+        app.run(&ctx, Action::ReplaceAll);
+        assert_eq!(app.docs[0].text.len(), 2000);
+        assert!(matches!(app.modal(), Some(Modal::Info(m)) if m.contains("上限")));
+    }
+
+    /// 1 件ずつの置換は、一覧の外 (上限より後ろ) の一致も置換できる
+    #[test]
+    fn replace_one_works_beyond_stored_matches() {
+        let ctx = egui::Context::default();
+        let mut app = App::blank(ctx.clone());
+        let n = search::MAX_STORED_MATCHES + 10;
+        app.docs[0].text = "a".repeat(n);
+        app.docs[0].edited();
+        app.find.query = "a".into();
+        app.find.replacement = "Z".into();
+        let id = editor_id(app.docs[0].id);
+        set_editor_sel(&ctx, id, n - 3, n - 2);
+        app.run(&ctx, Action::ReplaceOne);
+        assert_eq!(app.docs[0].text.chars().nth(n - 3), Some('Z'));
+        assert_eq!(app.docs[0].text.matches('Z').count(), 1);
+        // 次の一致が選択されている
+        assert_eq!(editor_sel(&ctx, id), Some((n - 2, n - 1)));
+    }
+
+    /// 現在位置は 1 フレームに 1 回求め、一覧が昇順なので二分探索で引く
+    #[test]
+    fn find_position_is_computed_once_per_frame() {
+        let ctx = egui::Context::default();
+        let mut app = App::blank(ctx.clone());
+        app.docs[0].text = "ab ab ab".into();
+        app.docs[0].edited();
+        app.find.open = true;
+        app.find.query = "ab".into();
+        let id = editor_id(app.docs[0].id);
+        let mut t = 0.0;
+        frame(&ctx, &mut app, &mut t, vec![], false);
+        set_editor_sel(&ctx, id, 3, 5);
+        frame(&ctx, &mut app, &mut t, vec![], false);
+        assert_eq!(app.find_pos.exact, Some(1));
+        assert_eq!(app.find_pos.current, Some(1));
+        set_editor_sel(&ctx, id, 5, 5);
+        frame(&ctx, &mut app, &mut t, vec![], false);
+        assert_eq!(app.find_pos.exact, None);
+        assert_eq!(app.find_pos.current, Some(2), "選択の後ろの次の一致");
+        assert_eq!(with_commas(100_000), "100,000");
+        assert_eq!(with_commas(999), "999");
+        assert_eq!(with_commas(1_234_567), "1,234,567");
+    }
+
+    // ---- 改行混在の表示 (項目 19)
+
+    /// 改行コードの混在は、保存して統一するまで文書ごとに覚えておく
+    /// (他のタブの読み込みなどで状態表示が変わっても消えない)
+    #[test]
+    fn mixed_eol_is_kept_per_document_until_saved() {
+        let t = Tmp::new();
+        let m = t.file("mixed.txt", b"a\r\nb\nc\r");
+        let other = t.file("other.txt", b"plain");
+        let mut app = app();
+        open(&mut app, &m);
+        assert!(app.docs[0].mixed_eol);
+        open(&mut app, &other);
+        assert!(!app.docs[1].mixed_eol);
+        assert!(app.docs[0].mixed_eol, "他のタブを開いても残る");
+        assert!(!app.status.contains("混在"), "状態表示からは消える");
+        // 描画できる (状態表示に、タブごとの表示が出る)
+        let ctx = app.ctx.clone();
+        app.active = 0;
+        let mut clock = 0.0;
+        frame(&ctx, &mut app, &mut clock, vec![], false);
+        // 保存すると解除される
+        edit(&mut app, 0, |s| s.push('!'));
+        app.run(&ctx, Action::Save);
+        assert!(!app.docs[0].mixed_eol);
+        // 読み直しで改行が混在していれば、また立つ
+        std::fs::write(&m, b"x\r\ny\n").unwrap();
+        app.run(&ctx, Action::Reload(Enc::Utf8));
+        wait_loads(&mut app);
+        assert!(app.docs[0].mixed_eol);
+    }
+
+    /// 変更の世代: 本文の編集・保存・文字コード/改行コードの変更で進む
+    #[test]
+    fn document_generation_tracks_every_change() {
+        let t = Tmp::new();
+        let p = t.file("g.txt", b"abc");
+        let mut app = app();
+        open(&mut app, &p);
+        let ctx = app.ctx.clone();
+        let g0 = app.docs[0].generation;
+        edit(&mut app, 0, |s| s.push('x'));
+        let g1 = app.docs[0].generation;
+        assert!(g1 > g0);
+        app.run(&ctx, Action::SetEol(Eol::Lf));
+        let g2 = app.docs[0].generation;
+        assert!(g2 > g1);
+        app.run(&ctx, Action::Convert(Enc::Utf8Bom));
+        let g3 = app.docs[0].generation;
+        assert!(g3 > g2);
+        app.run(&ctx, Action::Save);
+        assert!(app.docs[0].generation > g3);
     }
 }

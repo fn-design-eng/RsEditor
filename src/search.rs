@@ -52,27 +52,31 @@ struct Folded {
     last: bool,
 }
 
-/// 大文字・小文字を区別しない検索 (KMP, 線形時間)。
+/// 大文字・小文字を区別しない検索 (KMP, 線形時間)。一致を 1 件見つけるたびに `f` を呼ぶ
+/// (`f` が false を返したらそこで止める)。
 ///
 /// 文書全体の畳み込み済み配列は作らず、検索語の長さ分だけの履歴を持ちながら
 /// 先頭から 1 文字ずつ流し込む (大きな文書でもメモリは増えない)。
-fn find_bytes_ci(text: &str, query: &str) -> Vec<(usize, usize)> {
+fn for_each_match_ci(text: &str, query: &str, mut f: impl FnMut(usize, usize) -> bool) {
     let mut q: Vec<char> = Vec::new();
     for c in query.chars() {
         fold_char(c, |l, _| q.push(l));
     }
     if q.is_empty() {
-        return Vec::new();
+        return;
     }
     let fail = kmp_table(&q);
     let mut window: VecDeque<Folded> = VecDeque::with_capacity(q.len().min(1 << 16) + 1);
-    let mut out = Vec::new();
     let mut last_end = 0;
     let mut k = 0;
+    let mut stop = false;
     for (start, c) in text.char_indices() {
         let end = start + c.len_utf8();
         let mut first = true;
         fold_char(c, |l, last| {
+            if stop {
+                return;
+            }
             if window.len() == q.len() {
                 window.pop_front();
             }
@@ -94,33 +98,145 @@ fn find_bytes_ci(text: &str, query: &str) -> Vec<(usize, usize)> {
                 let head = &window[0];
                 let tail = &window[q.len() - 1];
                 if head.first && tail.last && head.src_start >= last_end {
-                    out.push((head.src_start, tail.src_end));
                     last_end = tail.src_end;
+                    if !f(head.src_start, tail.src_end) {
+                        stop = true;
+                    }
                 }
                 k = fail[k - 1];
             }
         });
+        if stop {
+            return;
+        }
     }
-    out
 }
 
-/// `text` の中の `query` の出現位置を (開始, 終了) のバイト位置で返す。
+/// `text` の中の `query` の出現を、左から順に (開始, 終了) のバイト位置で `f` に渡す
+/// (`f` が false を返したらそこで止める。何も確保しない)。
 ///
 /// 出現は左から順に重ならないように拾う (例: "aaa" の "aa" は 1 件)。
 /// 隣接する出現 (例: "aaaa" の "aa" は 2 件) はそれぞれ数える。
 /// 空の検索語は何も返さない。
-pub fn find_bytes(text: &str, query: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
+pub fn for_each_match(
+    text: &str,
+    query: &str,
+    case_sensitive: bool,
+    mut f: impl FnMut(usize, usize) -> bool,
+) {
     if query.is_empty() {
-        return Vec::new();
+        return;
     }
     if case_sensitive {
         // std の str 検索は Two-Way アルゴリズム (線形時間)。重ならない出現を左から返す
-        text.match_indices(query)
-            .map(|(i, m)| (i, i + m.len()))
-            .collect()
+        for (i, m) in text.match_indices(query) {
+            if !f(i, i + m.len()) {
+                return;
+            }
+        }
     } else {
-        find_bytes_ci(text, query)
+        for_each_match_ci(text, query, f);
     }
+}
+
+/// 一致を覚えておく件数の上限。短い検索語を大きな文書で探したときに、一致の一覧と
+/// 強調の表示がメモリを使い尽くさないようにする (それ以上は強調・一覧に含めない)
+pub const MAX_STORED_MATCHES: usize = 100_000;
+
+/// 先頭から最大 `limit` 件の一致をバイト位置で返す。戻り値の bool は、`limit` を超える
+/// 一致がまだ残っているか (残りは数えずに打ち切る)
+pub fn find_bytes_limited(
+    text: &str,
+    query: &str,
+    case_sensitive: bool,
+    limit: usize,
+) -> (Vec<(usize, usize)>, bool) {
+    let mut out = Vec::new();
+    let mut capped = false;
+    for_each_match(text, query, case_sensitive, |s, e| {
+        if out.len() >= limit {
+            capped = true;
+            return false;
+        }
+        out.push((s, e));
+        true
+    });
+    (out, capped)
+}
+
+/// `text` の中の `query` の出現位置を (開始, 終了) のバイト位置ですべて返す (テスト用)
+#[cfg(test)]
+pub fn find_bytes(text: &str, query: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
+    find_bytes_limited(text, query, case_sensitive, usize::MAX).0
+}
+
+/// 一致の件数と、一致した部分の合計バイト数。範囲を保存しないので、メモリは増えない
+pub fn count_matches(text: &str, query: &str, case_sensitive: bool) -> (usize, usize) {
+    let (mut n, mut bytes) = (0usize, 0usize);
+    for_each_match(text, query, case_sensitive, |s, e| {
+        n += 1;
+        bytes += e - s;
+        true
+    });
+    (n, bytes)
+}
+
+/// バイト位置 `from` 以降で最初の一致 (バイト範囲)。無ければ先頭に折り返す。
+/// 一致の取り方は一覧 (`find_bytes_limited`) と同じで、文書の長さに比例する時間で終わる
+pub fn find_next(
+    text: &str,
+    query: &str,
+    case_sensitive: bool,
+    from: usize,
+) -> Option<(usize, usize)> {
+    let (mut first, mut found) = (None, None);
+    for_each_match(text, query, case_sensitive, |s, e| {
+        first.get_or_insert((s, e));
+        if s >= from {
+            found = Some((s, e));
+            return false;
+        }
+        true
+    });
+    found.or(first)
+}
+
+/// バイト位置 `from` より前 (終わりが `from` 以下) で最後の一致。無ければ末尾に折り返す
+pub fn find_prev(
+    text: &str,
+    query: &str,
+    case_sensitive: bool,
+    from: usize,
+) -> Option<(usize, usize)> {
+    let (mut before, mut last) = (None, None);
+    for_each_match(text, query, case_sensitive, |s, e| {
+        last = Some((s, e));
+        if e <= from {
+            before = Some((s, e));
+            true
+        } else {
+            // 以降は `from` より後ろ。手前に一致があれば確定。無ければ末尾まで進んで折り返す
+            before.is_none()
+        }
+    });
+    before.or(last)
+}
+
+/// バイト範囲 `bs..be` が、それ自体で 1 つの一致になっているか
+/// (選択がちょうど一致箇所かの確認用。一覧に載っていない一致にも使える)
+pub fn is_exact_match(text: &str, bs: usize, be: usize, query: &str, case_sensitive: bool) -> bool {
+    let Some(slice) = text.get(bs..be) else {
+        return false;
+    };
+    if slice.is_empty() {
+        return false;
+    }
+    let mut hit = None;
+    for_each_match(slice, query, case_sensitive, |s, e| {
+        hit = Some((s, e));
+        false
+    });
+    hit == Some((0, slice.len()))
 }
 
 /// バイト範囲の列 (昇順・重ならない) を文字位置の範囲に変換する。1 回の走査で済む
@@ -137,9 +253,15 @@ pub fn bytes_to_chars(text: &str, ranges: &[(usize, usize)]) -> Vec<(usize, usiz
     out
 }
 
-/// `text` の中の `query` の出現位置を (開始, 終了) の文字位置で返す (規則は `find_bytes` と同じ)
+/// `text` の中の `query` の出現位置を (開始, 終了) の文字位置で返す (規則は `find_bytes` と同じ。テスト用)
+#[cfg(test)]
 pub fn find_all(text: &str, query: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
     bytes_to_chars(text, &find_bytes(text, query, case_sensitive))
+}
+
+/// バイト位置を文字位置に変換する
+pub fn byte_to_char(text: &str, byte: usize) -> usize {
+    text[..byte].chars().count()
 }
 
 /// 文字位置をバイト位置に変換する (文字数を超える場合は text.len())
@@ -208,6 +330,44 @@ pub fn replace_ranges(
     Ok(out)
 }
 
+/// すべての一致を `replacement` に置き換えた文字列を、ストリーミングで作る。
+/// 戻り値は (置換後の文字列, 置換した件数)。一致が 0 件のときは、何も作らず空の文字列を返す。
+///
+/// 一致の範囲は保存しない。1 回目の走査で件数と合計バイト数だけを数え、置換後の大きさを
+/// 先に (桁あふれに注意して) 計算して `limit` を超えるときや確保に失敗するときは断る。
+/// 2 回目の走査で、結果を端から組み立てる。
+pub fn replace_all_streaming(
+    text: &str,
+    query: &str,
+    replacement: &str,
+    case_sensitive: bool,
+    limit: usize,
+) -> Result<(String, usize), ReplaceError> {
+    let (n, removed) = count_matches(text, query, case_sensitive);
+    if n == 0 {
+        return Ok((String::new(), 0));
+    }
+    let new_len = n
+        .checked_mul(replacement.len())
+        .and_then(|added| (text.len() - removed).checked_add(added))
+        .ok_or(ReplaceError::TooLarge)?;
+    if new_len > limit {
+        return Err(ReplaceError::TooLarge);
+    }
+    let mut out = String::new();
+    out.try_reserve_exact(new_len)
+        .map_err(|_| ReplaceError::OutOfMemory)?;
+    let mut last = 0;
+    for_each_match(text, query, case_sensitive, |s, e| {
+        out.push_str(&text[last..s]);
+        out.push_str(replacement);
+        last = e;
+        true
+    });
+    out.push_str(&text[last..]);
+    Ok((out, n))
+}
+
 /// すべての一致を `replacement` に置き換える。戻り値は (置換後の文字列, 置換した件数)
 #[cfg(test)]
 pub fn replace_all(
@@ -216,32 +376,38 @@ pub fn replace_all(
     replacement: &str,
     case_sensitive: bool,
 ) -> Result<(String, usize), ReplaceError> {
-    let ranges = find_bytes(text, query, case_sensitive);
-    let out = replace_ranges(text, &ranges, replacement, MAX_REPLACE_RESULT)?;
-    Ok((out, ranges.len()))
+    let (out, n) =
+        replace_all_streaming(text, query, replacement, case_sensitive, MAX_REPLACE_RESULT)?;
+    Ok((if n == 0 { text.to_owned() } else { out }, n))
 }
 
-/// `from` (文字位置) より後ろで最初の一致の index。無ければ先頭に折り返す
+/// `from` (文字位置) 以降で最初の一致の index。無ければ先頭に折り返す。
+/// 一覧は昇順なので二分探索する
 pub fn next_index(matches: &[(usize, usize)], from: usize) -> Option<usize> {
     if matches.is_empty() {
         return None;
     }
-    Some(matches.iter().position(|&(s, _)| s >= from).unwrap_or(0))
+    let i = matches.partition_point(|&(s, _)| s < from);
+    Some(if i == matches.len() { 0 } else { i })
 }
 
-/// `from` より前で最後の一致の index。無ければ末尾に折り返す
+/// `from` より前 (終わりが `from` 以下) で最後の一致の index。無ければ末尾に折り返す
+#[cfg(test)]
 pub fn prev_index(matches: &[(usize, usize)], from: usize) -> Option<usize> {
     if matches.is_empty() {
         return None;
     }
-    Some(
-        matches
-            .iter()
-            .rposition(|&(_, e)| e <= from)
-            .unwrap_or(matches.len() - 1),
-    )
+    let i = matches.partition_point(|&(_, e)| e <= from);
+    Some(if i == 0 { matches.len() - 1 } else { i - 1 })
 }
 
+/// 選択 (sel_start..sel_end) がちょうど一致と同じなら、その一致の index (二分探索)
+pub fn exact_index(matches: &[(usize, usize)], sel_start: usize, sel_end: usize) -> Option<usize> {
+    let i = matches.partition_point(|&(s, _)| s < sel_start);
+    (matches.get(i) == Some(&(sel_start, sel_end))).then_some(i)
+}
+
+#[cfg(test)]
 /// 現在の選択 (sel_start..sel_end) に対応する一致の index。
 /// 選択がちょうど一致と同じならその一致、そうでなければ選択の後ろの次の一致
 /// (「次を検索」で移動する先) を返す
@@ -250,10 +416,7 @@ pub fn current_index(
     sel_start: usize,
     sel_end: usize,
 ) -> Option<usize> {
-    matches
-        .iter()
-        .position(|&m| m == (sel_start, sel_end))
-        .or_else(|| next_index(matches, sel_end))
+    exact_index(matches, sel_start, sel_end).or_else(|| next_index(matches, sel_end))
 }
 
 #[cfg(test)]
@@ -402,5 +565,115 @@ mod tests {
             Vec::<(usize, usize)>::new()
         );
         assert_eq!(bytes_to_chars("あいうえ", &[(3, 6), (9, 12)]), vec![(1, 2), (3, 4)]);
+    }
+
+    /// 一覧の上限: 短い検索語を大きな文書で探しても、保存する一致は上限まで
+    #[test]
+    fn stored_matches_are_capped() {
+        let text = "a".repeat(1_000_000);
+        let (r, capped) = find_bytes_limited(&text, "a", true, MAX_STORED_MATCHES);
+        assert_eq!(r.len(), MAX_STORED_MATCHES);
+        assert!(capped);
+        assert_eq!(r[0], (0, 1));
+        let (r, capped) = find_bytes_limited(&text, "a", false, 10);
+        assert_eq!((r.len(), capped), (10, true));
+        // ちょうど上限なら打ち切りではない
+        let (r, capped) = find_bytes_limited("aaa", "a", true, 3);
+        assert_eq!((r.len(), capped), (3, false));
+        // 件数の数え上げは範囲を保存せず、上限なしで数える
+        assert_eq!(count_matches(&text, "a", true), (1_000_000, 1_000_000));
+        assert_eq!(count_matches("あいあ", "あ", false), (2, 6));
+    }
+
+    /// 位置から探す: 一覧と同じ一致を、位置の前後・折り返しも含めて返す
+    #[test]
+    fn find_next_prev_match_the_list() {
+        for cs in [true, false] {
+            let text = "ab Ab aB xx AB
+ab";
+            let all = find_bytes(text, "ab", cs);
+            for from in 0..=text.len() {
+                let next = all.iter().find(|&&(s, _)| s >= from).or(all.first()).copied();
+                let prev = all.iter().rev().find(|&&(_, e)| e <= from).or(all.last()).copied();
+                assert_eq!(find_next(text, "ab", cs, from), next, "cs={cs} from={from}");
+                assert_eq!(find_prev(text, "ab", cs, from), prev, "cs={cs} from={from}");
+            }
+        }
+        assert_eq!(find_next("abc", "x", true, 0), None);
+        assert_eq!(find_prev("abc", "x", true, 3), None);
+        assert_eq!(find_next("abc", "", true, 0), None);
+        // 重なるパターンでも一覧 (左から重ならない) と同じ
+        assert_eq!(find_next("aaa", "aa", true, 1), Some((0, 2)));
+        // 大文字小文字を畳み込む検索 (複数文字に畳まれる İ) でも元の文字の境界
+        assert_eq!(find_next("aİb", "b", false, 0), Some((3, 4)));
+    }
+
+    /// 大きな文書でも、一覧を作らずに次・前の一致へ進める
+    #[test]
+    fn find_next_in_huge_text_needs_no_list() {
+        let mut text = "a".repeat(2_000_000);
+        text.push_str("needle");
+        assert_eq!(find_next(&text, "needle", true, 5), Some((2_000_000, 2_000_006)));
+        assert_eq!(find_prev(&text, "needle", false, 10), Some((2_000_000, 2_000_006)));
+        assert_eq!(find_next(&text, "a", true, 1_999_999), Some((1_999_999, 2_000_000)));
+    }
+
+    #[test]
+    fn streaming_replace_matches_list_based() {
+        for cs in [true, false] {
+            for (t, q, r) in [
+                ("abAB ab", "ab", "X"),
+                ("aaaa", "aa", "b"),
+                ("東京都東京", "東京", "大阪府"),
+                ("aİb", "b", "ccc"),
+                ("none", "zz", "y"),
+            ] {
+                let (got, n) = replace_all_streaming(t, q, r, cs, MAX_REPLACE_RESULT).unwrap();
+                let ranges = find_bytes(t, q, cs);
+                assert_eq!(n, ranges.len());
+                if n > 0 {
+                    assert_eq!(got, replace_ranges(t, &ranges, r, MAX_REPLACE_RESULT).unwrap());
+                }
+            }
+        }
+        // 上限は、結果を作る前に (数えただけで) 判定する
+        let text = "a".repeat(1000);
+        assert_eq!(
+            replace_all_streaming(&text, "a", &"x".repeat(1000), true, 100_000),
+            Err(ReplaceError::TooLarge)
+        );
+        assert_eq!(
+            replace_all_streaming("abc", "", "x", true, 10),
+            Ok((String::new(), 0))
+        );
+    }
+
+    #[test]
+    fn exact_match_check() {
+        assert!(is_exact_match("xx abc yy", 3, 6, "abc", true));
+        assert!(is_exact_match("xx ABC yy", 3, 6, "abc", false));
+        assert!(!is_exact_match("xx ABC yy", 3, 6, "abc", true));
+        assert!(!is_exact_match("xx abc yy", 3, 5, "abc", true));
+        assert!(!is_exact_match("xx abc yy", 2, 6, "abc", true));
+        assert!(!is_exact_match("あい", 1, 2, "あ", true), "文字の途中は範囲外");
+        assert!(!is_exact_match("abc", 1, 1, "", true));
+    }
+
+    /// 二分探索の index は、線形探索と同じ結果になる
+    #[test]
+    fn index_lookups_match_linear_scan() {
+        let m: Vec<(usize, usize)> = (0..20).map(|i| (i * 3 + 1, i * 3 + 3)).collect();
+        for from in 0..70 {
+            let next = m.iter().position(|&(s, _)| s >= from).unwrap_or(0);
+            assert_eq!(next_index(&m, from), Some(next));
+            let prev = m.iter().rposition(|&(_, e)| e <= from).unwrap_or(m.len() - 1);
+            assert_eq!(prev_index(&m, from), Some(prev));
+        }
+        for &sel in &m {
+            assert_eq!(exact_index(&m, sel.0, sel.1), m.iter().position(|&x| x == sel));
+        }
+        assert_eq!(exact_index(&m, 2, 3), None);
+        assert_eq!(exact_index(&[], 0, 0), None);
+        assert_eq!(byte_to_char("あいう", 6), 2);
     }
 }

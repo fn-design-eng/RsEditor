@@ -50,18 +50,44 @@ impl Enc {
     }
 }
 
+/// 全体が UTF-32 として成り立つか: 長さが 4 の倍数で、すべての 32 ビットの値が
+/// 文字として有効 (0x10FFFF 以下で、サロゲートでない)
+fn utf32_plausible(bytes: &[u8], le: bool) -> bool {
+    bytes.len() % 4 == 0
+        && bytes.chunks_exact(4).all(|c| {
+            let c = [c[0], c[1], c[2], c[3]];
+            let u = if le {
+                u32::from_le_bytes(c)
+            } else {
+                u32::from_be_bytes(c)
+            };
+            char::from_u32(u).is_some()
+        })
+}
+
 /// 未対応の BOM (UTF-32) なら、その名前を返す。
 ///
 /// UTF-32LE の BOM (FF FE 00 00) は UTF-16LE の BOM (FF FE) で始まるため、
-/// 先に調べないと UTF-16LE として誤って開いてしまう。
+/// 先に調べないと UTF-16LE として誤って開いてしまう。ただし、先頭が U+0000 の UTF-16LE
+/// ファイル (FF FE 00 00 41 00 ...) も同じバイト列で始まる。そこで、全体が UTF-32 として
+/// 成り立つとき (長さが 4 の倍数で、すべての値が有効な文字) だけ UTF-32 とみなす。
 pub fn unsupported_bom(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
+    if bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) && utf32_plausible(bytes, true) {
         Some("UTF-32 LE")
-    } else if bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) {
+    } else if bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) && utf32_plausible(bytes, false) {
         Some("UTF-32 BE")
     } else {
         None
     }
+}
+
+/// `unsupported_bom` が UTF-32 とみなしたファイルを、UTF-16 LE (BOM 付き) として読むこともできるか。
+/// UTF-16 としてもエラーなく読めるときだけ、その文字コードを返す (UTF-32 LE の BOM と
+/// UTF-16 LE の BOM + U+0000 が同じバイト列になる、あいまいなときの救済用)。
+/// UTF-32 BE の BOM (00 00 FE FF) は、UTF-16 の BOM としては成り立たないので対象外
+pub fn utf16_alternative(bytes: &[u8]) -> Option<Enc> {
+    (bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) && !decode(bytes, Enc::Utf16Le).1)
+        .then_some(Enc::Utf16Le)
 }
 
 /// BOM なしの UTF-16 らしさを調べる。
@@ -351,6 +377,30 @@ mod tests {
         );
         // UTF-16LE の BOM は未対応ではない
         assert_eq!(unsupported_bom(&[0xFF, 0xFE, 0x41, 0x00]), None);
+    }
+
+    /// 先頭が U+0000 の UTF-16LE (FF FE 00 00 41 00) は UTF-32 ではなく UTF-16
+    #[test]
+    fn utf16_starting_with_nul_is_not_utf32() {
+        let b = [0xFF, 0xFE, 0x00, 0x00, 0x41, 0x00];
+        assert_eq!(unsupported_bom(&b), None, "長さが 4 の倍数でない");
+        assert_eq!(detect(&b), Enc::Utf16Le);
+        assert_eq!(decode(&b, Enc::Utf16Le).0, "\u{0}A");
+        // 長さが 4 の倍数でも、UTF-32 として無効な値 (0x110000 超・サロゲート) を含めば UTF-16
+        let big = [0xFF, 0xFE, 0, 0, 0x41, 0x00, 0x11, 0x00];
+        assert_eq!(unsupported_bom(&big), None);
+        let sur = [0xFF, 0xFE, 0, 0, 0x00, 0xD8, 0x00, 0x00];
+        assert_eq!(unsupported_bom(&sur), None);
+        // どちらとも読めるものは UTF-32 として断り、UTF-16 の選択肢を示す
+        let both = [0xFF, 0xFE, 0, 0, b'a', 0, 0, 0];
+        assert_eq!(unsupported_bom(&both), Some("UTF-32 LE"));
+        assert_eq!(utf16_alternative(&both), Some(Enc::Utf16Le));
+        // UTF-32 BE の BOM は UTF-16 としては読めない
+        let be = [0, 0, 0xFE, 0xFF, 0, 0, 0, b'a'];
+        assert_eq!(unsupported_bom(&be), Some("UTF-32 BE"));
+        assert_eq!(utf16_alternative(&be), None);
+        // UTF-32 として無効な値を含む BE は UTF-32 とみなさない
+        assert_eq!(unsupported_bom(&[0, 0, 0xFE, 0xFF, 0xFF, 0, 0, 0]), None);
     }
 
     #[test]

@@ -1,0 +1,246 @@
+{
+  "_comment": "MANUAL_LICENSES 用の上流ライセンス本文。クレートの版を上げたらここを再確認する。sha256 は改行を LF にそろえて計算。",
+  "sources": {
+    "accesskit-02cf1aa": {
+      "url": "https://github.com/AccessKit/accesskit/tree/02cf1aa5dda9cb4d97ef7bbab486c039c35960a8",
+      "note": "crates.io の .cargo_vcs_info.json に記録されたコミット"
+    },
+    "accesskit-c1bd2d6": {
+      "url": "https://github.com/AccessKit/accesskit/tree/c1bd2d610615a244fd9e8bba0a6c3aecbfe46821",
+      "note": "crates.io の .cargo_vcs_info.json に記録されたコミット"
+    },
+    "clipboard-win-ed27008": {
+      "url": "https://github.com/DoumanAsh/clipboard-win/tree/ed27008ae5d1f10cfbb266de039f0fb35fd05a56",
+      "note": ""
+    },
+    "codespan-fd389a1": {
+      "url": "https://github.com/brendanzab/codespan/tree/fd389a13f5bb6d625b71e2e4694b26e127f393f9",
+      "note": ""
+    },
+    "com-rs-5f6b2d4": {
+      "url": "https://github.com/microsoft/com-rs/tree/5f6b2d444be909e45c1fc9fa1862777ce0bde0b5",
+      "note": ""
+    },
+    "egui-fe368ba": {
+      "url": "https://github.com/emilk/egui/tree/fe368bacc4a15697e347607e73a56c0299b3d42d",
+      "note": "egui 0.29.1 のコミット"
+    },
+    "gpu-alloc-61020bd": {
+      "url": "https://github.com/zakarumych/gpu-alloc/tree/61020bdcb4eb04fca6bbf748aeb9570e859236e0",
+      "note": "COPYING は license/ 以下の本文を指す"
+    },
+    "gpu-alloc-7ddd1fe": {
+      "url": "https://github.com/zakarumych/gpu-alloc/tree/7ddd1fe576fcfc503347eb97e476a47581479f22",
+      "note": "COPYING は license/ 以下の本文を指す"
+    },
+    "gpu-descriptor-bb28b4e": {
+      "url": "https://github.com/zakarumych/gpu-descriptor/tree/bb28b4e55b742e0ea3e7a0968e7ee6287ba0e06a",
+      "note": "COPYING は license/ 以下の本文を指す"
+    },
+    "gpu-descriptor-9f2fb95": {
+      "url": "https://github.com/zakarumych/gpu-descriptor/tree/9f2fb9546591322e7b77ee1e79385e01effd85e4",
+      "note": "COPYING は license/ 以下の本文を指す"
+    },
+    "wgpu-5c5c8b1": {
+      "url": "https://github.com/gfx-rs/wgpu/tree/5c5c8b1d4d2d965fbd10b290ee26f4e7eb158d7c",
+      "note": "naga 22.1.0 のコミット"
+    },
+    "profiling-8271551": {
+      "url": "https://github.com/aclysma/profiling/tree/8271551172eb6fa4cba47369aedd93790c623df9",
+      "note": ""
+    },
+    "rspirv-e91a5de": {
+      "url": "https://github.com/gfx-rs/rspirv/tree/e91a5debc10c395b36db7721dfff6326d697a1e2",
+      "note": ""
+    },
+    "cc0-1.0": {
+      "url": "https://creativecommons.org/publicdomain/zero/1.0/legalcode.txt",
+      "note": "公式の CC0 1.0 法的文書"
+    }
+  },
+  "crates": {
+    "accesskit 0.16.3": {
+      "files": [
+        "accesskit-02cf1aa/LICENSE-APACHE",
+        "accesskit-02cf1aa/LICENSE-MIT",
+        "accesskit-02cf1aa/LICENSE.chromium"
+      ]
+    },
+    "accesskit_consumer 0.24.3": {
+      "files": [
+        "accesskit-02cf1aa/LICENSE-APACHE",
+        "accesskit-02cf1aa/LICENSE-MIT",
+        "accesskit-02cf1aa/LICENSE.chromium"
+      ]
+    },
+    "accesskit_windows 0.23.2": {
+      "files": [
+        "accesskit-02cf1aa/LICENSE-APACHE",
+        "accesskit-02cf1aa/LICENSE-MIT",
+        "accesskit-02cf1aa/LICENSE.chromium"
+      ]
+    },
+    "accesskit_winit 0.22.4": {
+      "files": [
+        "accesskit-c1bd2d6/LICENSE-APACHE",
+        "accesskit-c1bd2d6/LICENSE.chromium"
+      ],
+      "note": "Apache-2.0 のみのクレート (LICENSE-MIT は適用外)"
+    },
+    "clipboard-win 5.4.3": {
+      "files": [
+        "clipboard-win-ed27008/LICENSE"
+      ]
+    },
+    "codespan-reporting 0.11.1": {
+      "files": [
+        "codespan-fd389a1/LICENSE"
+      ]
+    },
+    "com_macros 0.6.0": {
+      "files": [
+        "com-rs-5f6b2d4/LICENSE"
+      ]
+    },
+    "com_macros_support 0.6.0": {
+      "files": [
+        "com-rs-5f6b2d4/LICENSE"
+      ]
+    },
+    "ecolor 0.29.1": {
+      "files": [
+        "egui-fe368ba/LICENSE-APACHE",
+        "egui-fe368ba/LICENSE-MIT"
+      ]
+    },
+    "eframe 0.29.1": {
+      "files": [
+        "egui-fe368ba/LICENSE-APACHE",
+        "egui-fe368ba/LICENSE-MIT"
+      ]
+    },
+    "egui 0.29.1": {
+      "files": [
+        "egui-fe368ba/LICENSE-APACHE",
+        "egui-fe368ba/LICENSE-MIT"
+      ]
+    },
+    "egui-wgpu 0.29.1": {
+      "files": [
+        "egui-fe368ba/LICENSE-APACHE",
+        "egui-fe368ba/LICENSE-MIT"
+      ]
+    },
+    "egui-winit 0.29.1": {
+      "files": [
+        "egui-fe368ba/LICENSE-APACHE",
+        "egui-fe368ba/LICENSE-MIT"
+      ]
+    },
+    "egui_glow 0.29.1": {
+      "files": [
+        "egui-fe368ba/LICENSE-APACHE",
+        "egui-fe368ba/LICENSE-MIT"
+      ]
+    },
+    "emath 0.29.1": {
+      "files": [
+        "egui-fe368ba/LICENSE-APACHE",
+        "egui-fe368ba/LICENSE-MIT"
+      ]
+    },
+    "epaint 0.29.1": {
+      "files": [
+        "egui-fe368ba/LICENSE-APACHE",
+        "egui-fe368ba/LICENSE-MIT"
+      ]
+    },
+    "epaint_default_fonts 0.29.1": {
+      "files": [
+        "egui-fe368ba/LICENSE-APACHE",
+        "egui-fe368ba/LICENSE-MIT"
+      ]
+    },
+    "gpu-alloc 0.6.2": {
+      "files": [
+        "gpu-alloc-61020bd/COPYING",
+        "gpu-alloc-61020bd/LICENSE-APACHE",
+        "gpu-alloc-61020bd/LICENSE-MIT"
+      ]
+    },
+    "gpu-alloc-types 0.3.1": {
+      "files": [
+        "gpu-alloc-7ddd1fe/COPYING",
+        "gpu-alloc-7ddd1fe/LICENSE-APACHE",
+        "gpu-alloc-7ddd1fe/LICENSE-MIT"
+      ]
+    },
+    "gpu-descriptor 0.3.2": {
+      "files": [
+        "gpu-descriptor-bb28b4e/COPYING",
+        "gpu-descriptor-bb28b4e/LICENSE-APACHE",
+        "gpu-descriptor-bb28b4e/LICENSE-MIT"
+      ]
+    },
+    "gpu-descriptor-types 0.2.0": {
+      "files": [
+        "gpu-descriptor-9f2fb95/COPYING",
+        "gpu-descriptor-9f2fb95/LICENSE-APACHE",
+        "gpu-descriptor-9f2fb95/LICENSE-MIT"
+      ]
+    },
+    "hexf-parse 0.2.1": {
+      "files": [
+        "cc0-1.0/legalcode.txt"
+      ],
+      "note": "上流 (lifthrasiir/hexf 4225763) にはライセンス本文のファイルが無く、Cargo.toml が CC0-1.0 を宣言しているのみ。そのため公式の CC0 1.0 法的文書を使う。クレートの著作権表示は Cargo.toml の authors (Kang Seonghoon) を参照。"
+    },
+    "naga 22.1.0": {
+      "files": [
+        "wgpu-5c5c8b1/LICENSE.APACHE",
+        "wgpu-5c5c8b1/LICENSE.MIT"
+      ]
+    },
+    "profiling 1.0.18": {
+      "files": [
+        "profiling-8271551/LICENSE-APACHE",
+        "profiling-8271551/LICENSE-MIT"
+      ]
+    },
+    "spirv 0.3.0+sdk-1.3.268.0": {
+      "files": [
+        "rspirv-e91a5de/LICENSE"
+      ]
+    }
+  },
+  "sha256": {
+    "accesskit-02cf1aa/LICENSE-APACHE": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+    "accesskit-02cf1aa/LICENSE-MIT": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+    "accesskit-02cf1aa/LICENSE.chromium": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308",
+    "accesskit-c1bd2d6/LICENSE-APACHE": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+    "accesskit-c1bd2d6/LICENSE.chromium": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308",
+    "clipboard-win-ed27008/LICENSE": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566",
+    "codespan-fd389a1/LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "com-rs-5f6b2d4/LICENSE": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383",
+    "egui-fe368ba/LICENSE-APACHE": "8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90",
+    "egui-fe368ba/LICENSE-MIT": "95ca92f5f8ea5231f1580b3a2a799e8260af3114b900e1def5355a7f44bcf60c",
+    "gpu-alloc-61020bd/COPYING": "12121dfa588677007848ab922a45a1e3248868f6ff063598fceb3141d7897314",
+    "gpu-alloc-61020bd/LICENSE-APACHE": "58317934bf818c379e4215fad7e8dfb6812edff32c9557b8b039343f69711e08",
+    "gpu-alloc-61020bd/LICENSE-MIT": "f774bf68151714985324d90adbd59e8f271b7ba518608d871b6ba16464692879",
+    "gpu-alloc-7ddd1fe/COPYING": "12121dfa588677007848ab922a45a1e3248868f6ff063598fceb3141d7897314",
+    "gpu-alloc-7ddd1fe/LICENSE-APACHE": "58317934bf818c379e4215fad7e8dfb6812edff32c9557b8b039343f69711e08",
+    "gpu-alloc-7ddd1fe/LICENSE-MIT": "f774bf68151714985324d90adbd59e8f271b7ba518608d871b6ba16464692879",
+    "gpu-descriptor-bb28b4e/COPYING": "f72143f7e9d9fb8bd336b139fa22f825a299591c29f2f7338c5566347b137613",
+    "gpu-descriptor-bb28b4e/LICENSE-APACHE": "6bec8c944a6d4251be50ac86bb4ca360bcce5aea472505dee2800e160bf1cdbf",
+    "gpu-descriptor-bb28b4e/LICENSE-MIT": "5226e27d5fbc683db56c52853cdb9d15b69abadb525a60f95c862c2dbd77cdc8",
+    "gpu-descriptor-9f2fb95/COPYING": "f72143f7e9d9fb8bd336b139fa22f825a299591c29f2f7338c5566347b137613",
+    "gpu-descriptor-9f2fb95/LICENSE-APACHE": "6bec8c944a6d4251be50ac86bb4ca360bcce5aea472505dee2800e160bf1cdbf",
+    "gpu-descriptor-9f2fb95/LICENSE-MIT": "5226e27d5fbc683db56c52853cdb9d15b69abadb525a60f95c862c2dbd77cdc8",
+    "cc0-1.0/legalcode.txt": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499",
+    "wgpu-5c5c8b1/LICENSE.APACHE": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9",
+    "wgpu-5c5c8b1/LICENSE.MIT": "c7fea58d1cfe49634cd92e54fc10a9d871f4b275321a4cd8c09e449122caaeb4",
+    "profiling-8271551/LICENSE-APACHE": "10d30a673cd5e9349bdc02aeb48f14b3386d27d0da32df8f0a555d4aa16aa551",
+    "profiling-8271551/LICENSE-MIT": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333",
+    "rspirv-e91a5de/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+  }
+}
